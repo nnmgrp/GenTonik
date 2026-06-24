@@ -145,6 +145,11 @@ import {
   applyToPoint,
   type Matrix,
 } from './transform-matrix';
+import {
+  computeHomography,
+  invertHomography,
+  applyHomography,
+} from './homography';
 
 // Re-export ToolId for consumers that import it from this module.
 export type ToolId =
@@ -238,38 +243,58 @@ function polylineBounds(points: Vec2[]): Bounds | null {
 }
 
 /**
- * Rasterize a closed polygon into a Uint8Array alpha mask using
- * NATIVE Canvas2D fill (Gemini 2.2 fix). Returns {width, height,
- * data, offsetX, offsetY} where the mask's (0,0) corresponds to
- * canvas-pixel (offsetX, offsetY).
- *
- * The previous JS scanline implementation was O(H * N) per polygon
- * and could block the main thread for 500ms+ on large selections.
- * Native Canvas fill is GPU-accelerated and ~500× faster.
+ * Map a canvas-space point to the layer's local coordinate space.
+ * Handles both affine and perspective transform modes.
  */
-function rasterizePolygon(
-  points: Vec2[],
-): { width: number; height: number; data: Uint8Array; offsetX: number; offsetY: number } {
-  const bounds = polylineBounds(points);
-  if (!bounds) {
-    return { width: 1, height: 1, data: new Uint8Array(1), offsetX: 0, offsetY: 0 };
+function canvasToLocalPoint(
+  p: Vec2,
+  activeLayer: Layer,
+  activeLayerNaturalSize: { w: number; h: number },
+  docSize: { w: number; h: number },
+): Vec2 {
+  const w = activeLayerNaturalSize.w;
+  const h = activeLayerNaturalSize.h;
+  if (activeLayer.transform.corners) {
+    const localCorners: [Vec2, Vec2, Vec2, Vec2] = [
+      { x: 0, y: 0 },
+      { x: w, y: 0 },
+      { x: w, y: h },
+      { x: 0, y: h },
+    ];
+    const H = computeHomography(localCorners, activeLayer.transform.corners);
+    if (!H) return p;
+    const invH = invertHomography(H);
+    if (!invH) return p;
+    return applyHomography(invH, p);
+  } else {
+    const layerM = composeLayerMatrix(activeLayer.transform, activeLayerNaturalSize, docSize);
+    const invM = invert(layerM);
+    if (!invM) return p;
+    const localCenterRel = applyToPoint(invM, p);
+    return {
+      x: localCenterRel.x + w / 2,
+      y: localCenterRel.y + h / 2,
+    };
   }
-  const offsetX = Math.floor(bounds.left);
-  const offsetY = Math.floor(bounds.top);
-  const width  = Math.max(1, Math.ceil(bounds.right) - offsetX);
-  const height = Math.max(1, Math.ceil(bounds.bottom) - offsetY);
+}
 
-  // Offscreen canvas the size of the polygon's AABB
+/**
+ * Rasterize a closed polygon in layer-local coordinates onto a canvas
+ * of the full layer size. Uses GPU-accelerated Canvas2D native fill.
+ */
+function rasterizePolygonFull(
+  points: Vec2[],
+  width: number,
+  height: number,
+): Uint8Array {
   const tempCanvas = document.createElement('canvas');
   tempCanvas.width = width;
   tempCanvas.height = height;
   const tempCtx = tempCanvas.getContext('2d');
   if (!tempCtx) {
-    return { width: 1, height: 1, data: new Uint8Array(1), offsetX, offsetY };
+    return new Uint8Array(width * height);
   }
 
-  // Translate so polygon points map into the temp canvas
-  tempCtx.translate(-offsetX, -offsetY);
   tempCtx.beginPath();
   tempCtx.moveTo(points[0].x, points[0].y);
   for (let i = 1; i < points.length; i++) {
@@ -279,60 +304,49 @@ function rasterizePolygon(
   tempCtx.fillStyle = 'white';
   tempCtx.fill();
 
-  // Extract alpha channel into a Uint8Array
   const imageData = tempCtx.getImageData(0, 0, width, height);
   const src = imageData.data;
   const data = new Uint8Array(width * height);
   for (let i = 0; i < data.length; i++) {
     data[i] = src[i * 4 + 3]; // alpha channel
   }
-  return { width, height, data, offsetX, offsetY };
+  return data;
 }
 
 /**
- * Build a LayerMask ('painted') from a closed polygon in canvas-space.
- * The mask is stored relative to a tight bounding box of the polygon.
+ * Build a LayerMask ('painted') from a closed polygon in document canvas-space.
+ * Maps points into layer-local space first, then rasterizes onto a full-sized mask.
  */
-function polygonToMask(points: Vec2[], invert: boolean = false): LayerMask {
+function selectionToMask(
+  points: Vec2[],
+  activeLayer: Layer,
+  activeLayerNaturalSize: { w: number; h: number },
+  docSize: { w: number; h: number },
+  invert: boolean = false,
+): LayerMask {
+  const w = activeLayerNaturalSize.w;
+  const h = activeLayerNaturalSize.h;
   if (points.length < 3) {
     return {
       type: 'painted',
-      width: 1,
-      height: 1,
-      data: new Uint8Array([0]),
+      width: w,
+      height: h,
+      data: new Uint8Array(w * h),
       invert,
     };
   }
-  const r = rasterizePolygon(points);
+  
+  // Inverse-transform points from document to layer-local coordinates
+  const localPoints = points.map(p =>
+    canvasToLocalPoint(p, activeLayer, activeLayerNaturalSize, docSize)
+  );
+
+  const data = rasterizePolygonFull(localPoints, w, h);
   return {
     type: 'painted',
-    width: r.width,
-    height: r.height,
-    data: r.data,
-    invert,
-  };
-}
-
-/**
- * Build a LayerMask ('shape') from a rect or ellipse marquee.
- * `bounds` is in canvas-space; the mask stores these bounds directly.
- */
-function marqueeToMask(
-  shape: 'rect' | 'ellipse',
-  bounds: Bounds,
-  feather: number = 0,
-  invert: boolean = false,
-): LayerMask {
-  return {
-    type: 'shape',
-    shape,
-    bounds: {
-      left:   Math.min(bounds.left, bounds.right),
-      top:    Math.min(bounds.top, bounds.bottom),
-      right:  Math.max(bounds.left, bounds.right),
-      bottom: Math.max(bounds.top, bounds.bottom),
-    },
-    feather,
+    width: w,
+    height: h,
+    data,
     invert,
   };
 }
@@ -1050,18 +1064,56 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
         if (Math.hypot(p.x - first.x, p.y - first.y) <= handleR * 1.5) {
           const pts = [...polygonPoints];
           setPolygonPoints([]);
-          onMaskChange?.(polygonToMask(pts), 'Polygonal Lasso');
+          onMaskChange?.(
+            selectionToMask(pts, activeLayer, activeLayerNaturalSize, docSize),
+            'Polygonal Lasso'
+          );
           return;
         }
       }
       setPolygonPoints(prev => [...prev, p]);
       return;
     }
-  }, [activeLayer, tool, screenToCanvas, zoom, polygonPoints, onMaskChange]);
+  }, [activeLayer, tool, screenToCanvas, zoom, polygonPoints, onMaskChange, activeLayerNaturalSize, docSize]);
 
   const onSelectionPointerMove = useCallback((e: ReactPointerEvent) => {
     if (!activeLayer) return;
     const p = screenToCanvas(e.clientX, e.clientY);
+
+    if (tool === 'polygonal' && polygonPoints.length > 0) {
+      const selCanvas = selectionCanvasRef.current;
+      if (selCanvas) {
+        const ctx = selCanvas.getContext('2d');
+        if (ctx) {
+          ctx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+          ctx.save();
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 1.5 / zoom;
+          ctx.beginPath();
+          ctx.moveTo(polygonPoints[0].x, polygonPoints[0].y);
+          for (let i = 1; i < polygonPoints.length; i++) {
+            ctx.lineTo(polygonPoints[i].x, polygonPoints[i].y);
+          }
+          ctx.lineTo(p.x, p.y);
+          ctx.stroke();
+
+          const r = 4 / zoom;
+          for (let i = 0; i < polygonPoints.length; i++) {
+            const pt = polygonPoints[i];
+            ctx.beginPath();
+            ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
+            ctx.fillStyle = i === 0 ? '#7cf' : '#fff';
+            ctx.fill();
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 1 / zoom;
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+      }
+      return;
+    }
+
     const drag = selectionDragRef.current;
     if (!drag) return;
 
@@ -1102,7 +1154,7 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
       }
       return;
     }
-  }, [activeLayer, tool, screenToCanvas]);
+  }, [activeLayer, tool, screenToCanvas, polygonPoints, zoom]);
 
   const onSelectionPointerUp = useCallback((e: ReactPointerEvent) => {
     if (!activeLayer) return;
@@ -1124,9 +1176,29 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
       setMarqueePreview(null);
       // Reject tiny selections (< 3 canvas px in any dim)
       if (b.right - b.left < 3 || b.bottom - b.top < 3) return;
+      
+      let selectionPts: Vec2[] = [];
+      if (tool === 'rect') {
+        selectionPts = [
+          { x: b.left, y: b.top },
+          { x: b.right, y: b.top },
+          { x: b.right, y: b.bottom },
+          { x: b.left, y: b.bottom },
+        ];
+      } else {
+        const cx = (b.left + b.right) / 2;
+        const cy = (b.top + b.bottom) / 2;
+        const rx = (b.right - b.left) / 2;
+        const ry = (b.bottom - b.top) / 2;
+        for (let i = 0; i < 64; i++) {
+          const t = (i / 64) * Math.PI * 2;
+          selectionPts.push({ x: cx + rx * Math.cos(t), y: cy + ry * Math.sin(t) });
+        }
+      }
+      
       onMaskChange?.(
-        marqueeToMask(tool, b),
-        tool === 'rect' ? 'Rect Marquee' : 'Ellipse Marquee',
+        selectionToMask(selectionPts, activeLayer, activeLayerNaturalSize, docSize),
+        tool === 'rect' ? 'Rect Marquee' : 'Ellipse Marquee'
       );
       return;
     }
@@ -1137,19 +1209,25 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
       // it above), and clear the canvas.
       setSelectionTick(t => t + 1);
       if (pts.length >= 3) {
-        onMaskChange?.(polygonToMask(pts), 'Freehand Lasso');
+        onMaskChange?.(
+          selectionToMask(pts, activeLayer, activeLayerNaturalSize, docSize),
+          'Freehand Lasso'
+        );
       }
       return;
     }
-  }, [activeLayer, tool, screenToCanvas, onMaskChange]);
+  }, [activeLayer, tool, screenToCanvas, onMaskChange, activeLayerNaturalSize, docSize]);
 
   const onSelectionDoubleClick = useCallback(() => {
     if (tool !== 'polygonal') return;
     if (polygonPoints.length < 3) return;
     const pts = [...polygonPoints];
     setPolygonPoints([]);
-    onMaskChange?.(polygonToMask(pts), 'Polygonal Lasso');
-  }, [tool, polygonPoints, onMaskChange]);
+    onMaskChange?.(
+      selectionToMask(pts, activeLayer, activeLayerNaturalSize, docSize),
+      'Polygonal Lasso'
+    );
+  }, [tool, polygonPoints, onMaskChange, activeLayer, activeLayerNaturalSize, docSize]);
 
   // ── Draw selection overlay (marquee / lasso / polygonal) ──
   // The overlay canvas is sized to docSize (canvas px) and positioned
