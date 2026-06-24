@@ -1,0 +1,450 @@
+@import "tailwindcss";
+
+/* ============================================================
+   GenToniK — Photoshop-style dark theme
+   ============================================================
+   Convention: all theme tokens are exposed as `--c-*` CSS vars.
+   Components consume them via `themeColor('name')` in App.tsx.
+   ============================================================ */
+
+:root,
+[data-theme="dark"] {
+  /* App shell */
+  --c-app-bg: #1a1a1d;          /* canvas viewport surrounding (PS "gray workspace") */
+  --c-sidebar-bg: #2b2b30;       /* left/right panels */
+  --c-topbar-bg: #232328;        /* menu bar */
+  --c-statusbar-bg: #232328;     /* bottom status bar */
+  --c-toolbox-bg: #2b2b30;       /* left toolbox strip */
+
+  /* Panels & sub-panels */
+  --c-panel-bg: rgba(43, 43, 48, 0.96);
+  --c-panel-border: rgba(80, 80, 90, 0.5);
+  --c-sub-bg: rgba(20, 20, 24, 0.6);
+  --c-sub-border: rgba(80, 80, 90, 0.35);
+
+  /* Inputs & buttons */
+  --c-input-bg: #1a1a1d;
+  --c-input-border: #4b5563;
+  --c-input-focus: #3b82f6;
+  --c-btn-secondary: #374151;
+  --c-btn-secondary-hover: #4b5563;
+  --c-btn-active: #3b82f6;
+  --c-select-bg: #1a1a1d;
+  --c-select-text: #ffffff;
+
+  /* Text */
+  --c-text: #f3f4f6;
+  --c-text-sec: #d1d5db;
+  --c-text-muted: #9ca3af;
+  --c-text-dim: #6b7280;
+
+  /* Borders & misc */
+  --c-border: rgba(80, 80, 90, 0.5);
+  --c-hover: rgba(80, 80, 90, 0.4);
+  --c-status-bg: rgba(35, 35, 40, 0.95);
+  --c-overlay-bg: rgba(0, 0, 0, 0.7);
+  --c-info-bg: rgba(28, 28, 32, 0.98);
+  --c-info-border: rgba(80, 80, 90, 0.6);
+
+  /* Checkerboard (document transparency) */
+  --c-checker1: #3a3a3a;
+  --c-checker2: #2d2d2d;
+
+  /* Photoshop-style accent */
+  --c-accent: #3b82f6;
+  --c-accent-hover: #60a5fa;
+  --c-accent-soft: rgba(59, 130, 246, 0.18);
+  --c-mask-overlay-bg: rgba(40, 40, 45, 0.95);
+  --c-mask-toolbar-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  --c-debug-bg: rgba(20, 20, 24, 0.97);
+  --c-debug-border: #333;
+  --c-layer-active: rgba(59, 130, 246, 0.25);
+  --c-layer-thumb-bg: #0d1117;
+  --c-warning: #f59e0b;
+  --c-success: #10b981;
+}
+
+[data-theme="light"] {
+  --c-app-bg: #d4d4d8;
+  --c-sidebar-bg: #f3f4f6;
+  --c-topbar-bg: #ffffff;
+  --c-statusbar-bg: #ffffff;
+  --c-toolbox-bg: #f3f4f6;
+
+  --c-panel-bg: rgba(255, 255, 255, 0.96);
+  --c-panel-border: rgba(209, 213, 219, 0.8);
+  --c-sub-bg: rgba(243, 244, 246, 0.7);
+  --c-sub-border: rgba(209, 213, 219, 0.5);
+
+  --c-input-bg: #ffffff;
+  --c-input-border: #d1d5db;
+  --c-input-focus: #3b82f6;
+  --c-btn-secondary: #e5e7eb;
+  --c-btn-secondary-hover: #d1d5db;
+  --c-btn-active: #3b82f6;
+  --c-select-bg: #ffffff;
+  --c-select-text: #111827;
+
+  --c-text: #111827;
+  --c-text-sec: #374151;
+  --c-text-muted: #6b7280;
+  --c-text-dim: #9ca3af;
+
+  --c-border: rgba(209, 213, 219, 0.8);
+  --c-hover: rgba(243, 244, 246, 0.8);
+  --c-status-bg: rgba(255, 255, 255, 0.95);
+  --c-overlay-bg: rgba(255, 255, 255, 0.7);
+  --c-info-bg: rgba(255, 255, 255, 0.98);
+  --c-info-border: rgba(209, 213, 219, 0.8);
+
+  --c-checker1: #e5e5e5;
+  --c-checker2: #d4d4d4;
+
+  --c-accent: #3b82f6;
+  --c-accent-hover: #2563eb;
+  --c-accent-soft: rgba(59, 130, 246, 0.15);
+}
+
+/* ============================================================
+   Base resets
+   ============================================================ */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+body {
+  background: var(--c-app-bg);
+  color: var(--c-text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 12px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+/* ============================================================
+   Custom scrollbars (.custom-scroll)
+   ============================================================ */
+.custom-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.custom-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scroll::-webkit-scrollbar-thumb {
+  background: var(--c-input-border);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.custom-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--c-text-dim);
+  background-clip: padding-box;
+}
+.custom-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--c-input-border) transparent;
+}
+
+/* ============================================================
+   Photoshop-style menu bar items
+   ============================================================ */
+.gt-menubar-item {
+  position: relative;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--c-text);
+  border-radius: 3px;
+  cursor: default;
+  user-select: none;
+}
+.gt-menubar-item:hover {
+  background: var(--c-hover);
+}
+
+/* ============================================================
+   Toolbox button (left vertical strip)
+   ============================================================ */
+.gt-tool-btn {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--c-text-sec);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  transition: background 80ms, border-color 80ms, color 80ms;
+}
+.gt-tool-btn:hover {
+  background: var(--c-hover);
+  color: var(--c-text);
+}
+.gt-tool-btn[data-active="true"] {
+  background: var(--c-accent-soft);
+  border-color: var(--c-accent);
+  color: var(--c-accent-hover);
+}
+.gt-tool-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.gt-tool-btn:disabled:hover {
+  background: transparent;
+}
+
+/* Toolbox tooltip (CSS-only, shown on hover) */
+.gt-tool-btn[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 4px 8px;
+  background: rgba(15, 15, 18, 0.96);
+  color: #fff;
+  font-size: 11px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 120ms ease 80ms;
+  z-index: 50;
+  border: 1px solid var(--c-border);
+}
+.gt-tool-btn[data-tooltip]:hover::after {
+  opacity: 1;
+}
+
+/* Toolbox group divider */
+.gt-tool-divider {
+  height: 1px;
+  margin: 6px 8px;
+  background: var(--c-border);
+}
+
+/* ============================================================
+   Collapsible section header (right Properties panel)
+   ============================================================ */
+.gt-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  background: var(--c-topbar-bg);
+  border-bottom: 1px solid var(--c-border);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--c-text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.gt-section-header:hover {
+  background: var(--c-hover);
+}
+.gt-section-header .gt-caret {
+  display: inline-block;
+  width: 8px;
+  font-size: 9px;
+  transition: transform 120ms;
+  color: var(--c-text-dim);
+}
+.gt-section-header[data-collapsed="true"] .gt-caret {
+  transform: rotate(-90deg);
+}
+.gt-section-body {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--c-border);
+}
+
+/* ============================================================
+   Status bar
+   ============================================================ */
+.gt-statusbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 10px;
+  height: 26px;
+  background: var(--c-statusbar-bg);
+  border-top: 1px solid var(--c-border);
+  color: var(--c-text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.gt-statusbar > .gt-status-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.gt-statusbar .gt-status-sep {
+  width: 1px;
+  height: 14px;
+  background: var(--c-border);
+}
+.gt-statusbar .gt-status-hint {
+  margin-left: auto;
+  color: var(--c-text-dim);
+  font-style: italic;
+}
+
+/* ============================================================
+   react-moveable overrides — make handles visible on dark canvas
+   ============================================================ */
+.moveable-control-box,
+.moveable-control-box .moveable-line,
+.moveable-control-box .moveable-control,
+.moveable-control-box .moveable-area {
+  pointer-events: auto !important;
+}
+.moveable-control-box .moveable-line {
+  background: #4d9fff !important;
+}
+.moveable-control-box .moveable-control {
+  background: #fff !important;
+  border: 2px solid #4d9fff !important;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5) !important;
+}
+
+/* Document surface outline (Photoshop "marching ants" look without animation) */
+.gt-doc-outline {
+  position: absolute;
+  pointer-events: none;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.18),
+    0 0 0 2px rgba(0, 0, 0, 0.55);
+}
+
+/* No-select helper for canvas viewport */
+.gt-noselect {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ============================================================
+   Rulers — top (horizontal) + left (vertical) of the canvas
+   ============================================================ */
+.gt-ruler {
+  /* The SVG inside handles all tick marks. Container just provides
+     background + border (borders applied inline per-orientation). */
+  cursor: default;
+  user-select: none;
+}
+.gt-ruler svg text {
+  /* Crisp, monospace labels so digit columns align */
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.35);
+  stroke-width: 0.4;
+}
+
+/* ============================================================
+   Right-click popup palette (Krita-style)
+   ============================================================ */
+.gt-popup-palette {
+  background: var(--c-info-bg);
+  border: 1px solid var(--c-info-border);
+  border-radius: 6px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0, 0, 0, 0.4);
+  padding: 4px;
+  font-size: 11px;
+  user-select: none;
+  overflow: hidden;
+}
+
+.gt-popup-header {
+  padding: 4px 8px 2px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  color: var(--c-text-dim);
+}
+
+.gt-popup-grid,
+.gt-popup-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+  padding: 2px 0;
+}
+
+.gt-popup-tool,
+.gt-popup-action {
+  display: grid;
+  grid-template-columns: 18px 1fr 14px;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--c-text-sec);
+  cursor: pointer;
+  text-align: left;
+  font-size: 11px;
+  transition: background 80ms, border-color 80ms, color 80ms;
+}
+.gt-popup-tool:hover,
+.gt-popup-action:hover {
+  background: var(--c-hover);
+  color: var(--c-text);
+}
+.gt-popup-tool[data-active="true"],
+.gt-popup-action[data-active="true"] {
+  background: var(--c-accent-soft);
+  border-color: var(--c-accent);
+  color: var(--c-accent-hover);
+}
+.gt-popup-tool:disabled,
+.gt-popup-action:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.gt-popup-tool:disabled:hover,
+.gt-popup-action:disabled:hover {
+  background: transparent;
+  color: var(--c-text-sec);
+}
+
+.gt-popup-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  text-align: center;
+}
+.gt-popup-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gt-popup-key {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 9px;
+  text-align: right;
+  color: var(--c-text-dim);
+  background: var(--c-sub-bg);
+  border-radius: 2px;
+  padding: 1px 3px;
+}
+
+.gt-popup-divider {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--c-border);
+}

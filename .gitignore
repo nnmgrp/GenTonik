@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Production build outputs
+dist/
+dist-tauri/
+build/
+out/
+
+# Tauri/Cargo builds
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/
+
+# IDE / System files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+
+# Local configuration files
+.env
+.env.local
+.env.*.local
+
+# Vite / bundler caches
+.vite/
+.eslintcache
