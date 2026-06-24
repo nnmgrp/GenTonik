@@ -452,6 +452,11 @@ function ParamEditorSimple({ params, onChange, dpi }: ParamEditorSimpleProps) {
   const convertFromPx = (px: number) => fromPx(px, params.unit, dpi);
   const convertToPx = (v: number) => toPx(v, params.unit, dpi);
 
+  // Gemini 2.4.2: chain-lock for Spacing X/Y. When locked (default),
+  // changing Spacing updates both axes synchronously. When unlocked,
+  // the user gets separate X and Y fields.
+  const [spacingLocked, setSpacingLocked] = useState(true);
+
   return (
     <div style={{ padding: '8px 4px' }}>
       <SelectField
@@ -480,23 +485,60 @@ function ParamEditorSimple({ params, onChange, dpi }: ParamEditorSimpleProps) {
         suffix={unitLabel}
       />
 
-      <NumberField
-        label="Spacing X"
-        value={convertFromPx(params.spacingX)}
-        onChange={v => onChange({ spacingX: convertToPx(v) })}
-        min={0.1}
-        step={0.1}
-        suffix={unitLabel}
-      />
+      {/* Gemini 2.4.2: Unified Spacing field with chain lock.
+          - Lock CLOSED (default): one field, edits both spacingX and spacingY.
+          - Lock OPEN: two fields (Spacing X, Spacing Y) for independent control.
+          The chain icon button toggles the lock state. */}
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4 }}>
+        <div style={{ flex: 1 }}>
+          <NumberField
+            label={spacingLocked ? 'Spacing' : 'Spacing X'}
+            value={convertFromPx(params.spacingX)}
+            onChange={v => {
+              const px = convertToPx(v);
+              if (spacingLocked) {
+                onChange({ spacingX: px, spacingY: px });
+              } else {
+                onChange({ spacingX: px });
+              }
+            }}
+            min={0.1}
+            step={0.1}
+            suffix={unitLabel}
+          />
+        </div>
+        <button
+          type="button"
+          onClick={() => setSpacingLocked(s => !s)}
+          title={spacingLocked ? 'Unlock X/Y (independent spacing)' : 'Lock X/Y (synchronous spacing)'}
+          style={{
+            ...styles.button,
+            width: 30,
+            height: 30,
+            padding: 0,
+            marginBottom: 4,
+            background: spacingLocked ? themeColor('input-focus') : themeColor('btn-secondary'),
+            color: spacingLocked ? '#fff' : themeColor('text-muted'),
+            border: `1px solid ${spacingLocked ? themeColor('input-focus') : themeColor('input-border')}`,
+            fontSize: 14,
+            lineHeight: 1,
+            flexShrink: 0,
+          }}
+        >
+          {spacingLocked ? '🔗' : '⛓'}
+        </button>
+      </div>
 
-      <NumberField
-        label="Spacing Y"
-        value={convertFromPx(params.spacingY)}
-        onChange={v => onChange({ spacingY: convertToPx(v) })}
-        min={0.1}
-        step={0.1}
-        suffix={unitLabel}
-      />
+      {!spacingLocked && (
+        <NumberField
+          label="Spacing Y"
+          value={convertFromPx(params.spacingY)}
+          onChange={v => onChange({ spacingY: convertToPx(v) })}
+          min={0.1}
+          step={0.1}
+          suffix={unitLabel}
+        />
+      )}
 
       <SliderField
         label="Density"
@@ -513,11 +555,11 @@ function ParamEditorSimple({ params, onChange, dpi }: ParamEditorSimpleProps) {
         onChange={v => onChange({ colorPattern: v })}
       />
 
-      <ColorField
-        label="Background"
-        value={params.colorBg}
-        onChange={v => onChange({ colorBg: v })}
-      />
+      {/* Gemini 2.4.4: Background field REMOVED from screentone params.
+          Background color belongs to the document or to a separate
+          Solid layer below the screentone — not to the screentone
+          itself. Removing it here keeps the param editor focused on
+          what the screentone actually controls (pattern + color). */}
 
       {/* Quick angle control — useful for lines/dots */}
       <NumberField
@@ -2120,7 +2162,8 @@ interface ToolbarProps {
   onDpiChange: (dpi: number) => void;
 }
 
-// Menu-bar style group label
+// Menu-bar style group label — kept for backward compat but the new
+// MenuBarDropdown component (below) is preferred for top-level menus.
 function MenuGroupLabel({ children }: { children: React.ReactNode }) {
   return (
     <span
@@ -2138,6 +2181,105 @@ function MenuGroupLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
+// ────────────────────────────────────────────────────────────
+// MenuBarDropdown — classic desktop-app dropdown menu
+// (Gemini 2.4.3 — replaces the flat button row in the top bar)
+// ────────────────────────────────────────────────────────────
+
+interface MenuItem {
+  label: string;
+  shortcut?: string;
+  onClick?: () => void;
+  disabled?: boolean;
+  separator?: boolean; // if true, render a divider instead
+}
+
+interface MenuBarDropdownProps {
+  label: string;
+  items: MenuItem[];
+}
+
+function MenuBarDropdown({ label, items }: MenuBarDropdownProps) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  // Close on outside click or Escape
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  return (
+    <div
+      ref={ref}
+      className="gt-menubar-item"
+      style={{ position: 'relative', padding: 0 }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        style={{
+          background: open ? themeColor('hover') : 'transparent',
+          border: 'none',
+          color: themeColor('text'),
+          fontSize: 12,
+          padding: '4px 10px',
+          borderRadius: 3,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+        }}
+      >
+        {label}
+      </button>
+      {open && (
+        <div
+          className="gt-menu-dropdown"
+          style={{
+            position: 'absolute',
+            top: '100%',
+            left: 0,
+            minWidth: 180,
+            marginTop: 2,
+            zIndex: 100,
+          }}
+        >
+          {items.map((item, i) => item.separator ? (
+            <div key={`s${i}`} className="gt-menu-separator" />
+          ) : (
+            <button
+              key={i}
+              type="button"
+              disabled={item.disabled}
+              onClick={() => {
+                setOpen(false);
+                item.onClick?.();
+              }}
+              className="gt-menu-item"
+              style={item.disabled ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
+            >
+              <span className="gt-menu-label">{item.label}</span>
+              {item.shortcut && <span className="gt-menu-shortcut">{item.shortcut}</span>}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Toolbar({
   onNewDoc, onOpenOra, onSaveOra, onExportPng, onImportPng,
   onUndo, onRedo, canUndo, canRedo,
@@ -2150,6 +2292,34 @@ function Toolbar({
 
   useEffect(() => { setW(docWidth); setH(docHeight); }, [docWidth, docHeight]);
 
+  // Gemini 2.4.3 — File / Edit / View / Image dropdown menus
+  const fileItems: MenuItem[] = [
+    { label: 'New',           onClick: onNewDoc },
+    { label: 'Open .ora…',    onClick: onOpenOra },
+    { label: 'Save .ora…',    onClick: onSaveOra },
+    { separator: true } as MenuItem,
+    { label: 'Import PNG…',   onClick: onImportPng },
+    { label: 'Export PNG…',   onClick: onExportPng },
+  ];
+  const editItems: MenuItem[] = [
+    { label: 'Undo', shortcut: 'Ctrl+Z',     onClick: onUndo, disabled: !canUndo },
+    { label: 'Redo', shortcut: 'Ctrl+⇧+Z',   onClick: onRedo, disabled: !canRedo },
+  ];
+  const viewItems: MenuItem[] = [
+    { label: paramMode === 'simple' ? 'Switch to Advanced' : 'Switch to Simple',
+      onClick: onToggleParamMode },
+  ];
+  const imageItems: MenuItem[] = [
+    { label: `${docWidth}×${docHeight} (resize)`, onClick: () => setEditingSize(true) },
+    { label: `DPI: ${dpi}`, onClick: () => {
+      const next = prompt('DPI:', String(dpi));
+      if (next) {
+        const n = parseInt(next, 10);
+        if (n > 0) onDpiChange(n);
+      }
+    } },
+  ];
+
   return (
     <div
       style={{
@@ -2157,7 +2327,7 @@ function Toolbar({
         padding: '0 10px',
         display: 'flex',
         alignItems: 'center',
-        gap: 6,
+        gap: 4,
         fontSize: 12,
         height: 36,
         flexShrink: 0,
@@ -2169,55 +2339,21 @@ function Toolbar({
 
       <div style={{ width: 1, height: 18, background: themeColor('border'), margin: '0 4px' }} />
 
-      <MenuGroupLabel>File</MenuGroupLabel>
-      <button onClick={onNewDoc}     style={{ ...styles.button, padding: '3px 8px', fontSize: 11 }}>New</button>
-      <button onClick={onOpenOra}    style={{ ...styles.button, padding: '3px 8px', fontSize: 11 }} title="Open .ora">Open</button>
-      <button onClick={onSaveOra}    style={{ ...styles.button, padding: '3px 8px', fontSize: 11 }} title="Save .ora">Save</button>
-      <button onClick={onImportPng}  style={{ ...styles.button, padding: '3px 8px', fontSize: 11 }}>Import</button>
-      <button onClick={onExportPng}  style={{ ...styles.button, padding: '3px 8px', fontSize: 11 }}>Export</button>
+      <MenuBarDropdown label="File"  items={fileItems} />
+      <MenuBarDropdown label="Edit"  items={editItems} />
+      <MenuBarDropdown label="View"  items={viewItems} />
+      <MenuBarDropdown label="Image" items={imageItems} />
 
-      <div style={{ width: 1, height: 18, background: themeColor('border'), margin: '0 4px' }} />
-
-      <MenuGroupLabel>Edit</MenuGroupLabel>
-      <button
-        onClick={onUndo}
-        disabled={!canUndo}
-        title="Undo (Ctrl+Z)"
-        style={{ ...styles.button, padding: '3px 8px', fontSize: 11, opacity: canUndo ? 1 : 0.4 }}
-      >↶ Undo</button>
-      <button
-        onClick={onRedo}
-        disabled={!canRedo}
-        title="Redo (Ctrl+Shift+Z)"
-        style={{ ...styles.button, padding: '3px 8px', fontSize: 11, opacity: canRedo ? 1 : 0.4 }}
-      >↷ Redo</button>
-
-      <div style={{ width: 1, height: 18, background: themeColor('border'), margin: '0 4px' }} />
-
-      <MenuGroupLabel>Image</MenuGroupLabel>
-      {editingSize ? (
-        <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+      {/* Inline image-size editor — appears when "resize" is clicked in the Image menu */}
+      {editingSize && (
+        <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginLeft: 8 }}>
           <input type="number" value={w} onChange={e => setW(parseInt(e.target.value) || 0)} style={{ ...styles.input, width: 56, padding: '2px 4px', fontSize: 11 }} />
           <span style={{ ...styles.textDim }}>×</span>
           <input type="number" value={h} onChange={e => setH(parseInt(e.target.value) || 0)} style={{ ...styles.input, width: 56, padding: '2px 4px', fontSize: 11 }} />
           <button onClick={() => { if (w > 0 && h > 0) onDocSizeChange(w, h); setEditingSize(false); }} style={{ ...styles.button, padding: '2px 6px', fontSize: 11 }}>✓</button>
           <button onClick={() => { setW(docWidth); setH(docHeight); setEditingSize(false); }} style={{ ...styles.button, padding: '2px 6px', fontSize: 11 }}>✕</button>
         </div>
-      ) : (
-        <button onClick={() => setEditingSize(true)} style={{ ...styles.button, padding: '3px 8px', fontSize: 11 }} title="Click to edit document size">
-          {docWidth}×{docHeight}
-        </button>
       )}
-      <label style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-        <span style={{ fontSize: 10, ...styles.textMuted }}>DPI</span>
-        <input
-          type="number"
-          value={dpi}
-          onChange={e => onDpiChange(Math.max(1, parseInt(e.target.value) || 72))}
-          min={1}
-          style={{ ...styles.input, width: 46, padding: '2px 4px', fontSize: 11 }}
-        />
-      </label>
 
       <div style={{ flex: 1 }} />
 
@@ -2283,6 +2419,18 @@ export default function App() {
   // Null = hidden; otherwise {x, y} = clientX/clientY where it appeared.
   const [popupPalette, setPopupPalette] = useState<{ x: number; y: number } | null>(null);
 
+  // ── NEW (v2.3 = Gemini 2.3): Adaptive perspective subdivision ──
+  // During a live perspective drag, drop to 2×2 grid (8 triangles)
+  // for ~16× speedup vs the 8×8 default. On commit, restore to 8×8
+  // (or 16×16 for export) for high-quality final render.
+  const [perspectiveSubdivisions, setPerspectiveSubdivisions] = useState<number>(8);
+
+  // ── NEW (v2.4 = Gemini 2.4.1): Active tab in left sidebar ──
+  // 'layers' shows the Layers panel full-height; 'presets' shows
+  // the Preset browser full-height. Tabs free up vertical space
+  // (previously split 40/60) so long lists are easier to scan.
+  const [leftPanelTab, setLeftPanelTab] = useState<'layers' | 'presets'>('layers');
+
   // ── NEW (v2.1): Pre-drag snapshot ref for undo ─────────
   // Captures the layers state BEFORE a transform drag begins so we
   // can push the correct "pre" snapshot to history. Without this,
@@ -2307,7 +2455,8 @@ export default function App() {
     docHeight: docSize.h,
     imageCache,
     dpi,
-  }), [docSize, imageCache, dpi]);
+    perspectiveSubdivisions,
+  }), [docSize, imageCache, dpi, perspectiveSubdivisions]);
 
   // ── Canvas composite ───────────────────────────────────
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -2629,6 +2778,12 @@ export default function App() {
         );
         forceRender(n => n + 1);
       }
+      // Gemini 2.3 fix: drop perspective subdivision to 2 during drag
+      // for instant feedback. Restored to 8 on commit. Only relevant
+      // when the active layer has perspective corners.
+      if (transform.corners || current.transform.corners) {
+        setPerspectiveSubdivisions(2);
+      }
     }
     setLayers(prev => prev.map(l =>
       l.id === selectedLayerId
@@ -2641,6 +2796,9 @@ export default function App() {
     // History was already pushed in handleTransformLive (first call).
     // Here we just reset the ref so the next drag starts fresh.
     preDragLayersRef.current = null;
+    // Gemini 2.3 fix: restore high-quality subdivision after drag ends.
+    // 8×8 = 128 triangles — good visual quality at interactive speeds.
+    setPerspectiveSubdivisions(8);
   }, []);
 
   const handleMaskChange = useCallback((mask: LayerMask | undefined, label: string) => {
@@ -2933,7 +3091,7 @@ export default function App() {
           hasActiveLayer={!!selectedLayer}
         />
 
-        {/* Left-mid: Layers + Presets (collapsed-friendly) */}
+        {/* Left-mid: Layers + Presets as tabs (Gemini 2.4.1) */}
         <aside
           style={{
             ...styles.sidebar,
@@ -2943,12 +3101,46 @@ export default function App() {
             flexDirection: 'column',
           }}
         >
-          {/* Layer panel — fixed height ~40% */}
-          <div style={{ height: '40%', borderBottom: `1px solid ${themeColor('border')}`, display: 'flex', flexDirection: 'column' }}>
-            <div style={{ padding: '6px 8px', fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, ...styles.textMuted, borderBottom: `1px solid ${themeColor('border')}` }}>
-              Layers
-            </div>
-            <div style={{ flex: 1, overflow: 'hidden' }}>
+          {/* Tab strip — switches between Layers and Presets.
+              Each tab gets the full sidebar height when active,
+              which gives long lists room to breathe. */}
+          <div style={{
+            display: 'flex',
+            borderBottom: `1px solid ${themeColor('border')}`,
+            background: themeColor('topbar-bg'),
+            flexShrink: 0,
+          }}>
+            {(['layers', 'presets'] as const).map(tab => {
+              const active = leftPanelTab === tab;
+              return (
+                <button
+                  key={tab}
+                  type="button"
+                  onClick={() => setLeftPanelTab(tab)}
+                  style={{
+                    flex: 1,
+                    padding: '7px 8px',
+                    fontSize: 11,
+                    fontWeight: 600,
+                    textTransform: 'uppercase',
+                    letterSpacing: 0.6,
+                    color: active ? themeColor('text') : themeColor('text-dim'),
+                    background: active ? themeColor('sidebar-bg') : 'transparent',
+                    border: 'none',
+                    borderBottom: active ? `2px solid ${themeColor('input-focus')}` : '2px solid transparent',
+                    cursor: 'pointer',
+                    transition: 'color 80ms, border-color 80ms',
+                  }}
+                >
+                  {tab === 'layers' ? 'Layers' : 'Presets'}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Active panel fills the rest of the sidebar */}
+          <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            {leftPanelTab === 'layers' ? (
               <LayerPanel
                 layers={layers}
                 selectedId={selectedLayerId}
@@ -2966,15 +3158,7 @@ export default function App() {
                 onChangeOpacity={handleChangeOpacity}
                 onEditMask={handleOpenMaskEditor}
               />
-            </div>
-          </div>
-
-          {/* Preset browser — fills the rest */}
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <div style={{ padding: '6px 8px', fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5, ...styles.textMuted, borderBottom: `1px solid ${themeColor('border')}` }}>
-              Presets
-            </div>
-            <div style={{ flex: 1, overflow: 'hidden' }}>
+            ) : (
               <PresetBrowser
                 onApply={handleApplyPreset}
                 onSaveCurrent={handleSavePreset}
@@ -2983,7 +3167,7 @@ export default function App() {
                 onImport={handleImportPresets}
                 refreshKey={presetRefreshKey}
               />
-            </div>
+            )}
           </div>
         </aside>
 

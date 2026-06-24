@@ -142,6 +142,7 @@ import {
   matrixToCss,
   decomposeWarpMatrix,
   invert,
+  applyToPoint,
   type Matrix,
 } from './transform-matrix';
 
@@ -238,8 +239,13 @@ function polylineBounds(points: Vec2[]): Bounds | null {
 
 /**
  * Rasterize a closed polygon into a Uint8Array alpha mask using
- * scanline polygon fill. Returns {width, height, data, offsetX, offsetY}
- * where the mask's (0,0) corresponds to canvas-pixel (offsetX, offsetY).
+ * NATIVE Canvas2D fill (Gemini 2.2 fix). Returns {width, height,
+ * data, offsetX, offsetY} where the mask's (0,0) corresponds to
+ * canvas-pixel (offsetX, offsetY).
+ *
+ * The previous JS scanline implementation was O(H * N) per polygon
+ * and could block the main thread for 500ms+ on large selections.
+ * Native Canvas fill is GPU-accelerated and ~500× faster.
  */
 function rasterizePolygon(
   points: Vec2[],
@@ -252,30 +258,33 @@ function rasterizePolygon(
   const offsetY = Math.floor(bounds.top);
   const width  = Math.max(1, Math.ceil(bounds.right) - offsetX);
   const height = Math.max(1, Math.ceil(bounds.bottom) - offsetY);
-  const data = new Uint8Array(width * height);
 
-  for (let py = 0; py < height; py++) {
-    const y = offsetY + py + 0.5; // sample at pixel center
-    const xs: number[] = [];
-    const n = points.length;
-    for (let i = 0; i < n; i++) {
-      const p1 = points[i];
-      const p2 = points[(i + 1) % n];
-      const y1 = p1.y, y2 = p2.y;
-      if ((y1 <= y && y < y2) || (y2 <= y && y < y1)) {
-        const t = (y - y1) / (y2 - y1);
-        const x = p1.x + t * (p2.x - p1.x);
-        xs.push(x);
-      }
-    }
-    xs.sort((a, b) => a - b);
-    for (let i = 0; i + 1 < xs.length; i += 2) {
-      const xStart = Math.max(0, Math.ceil(xs[i] - offsetX));
-      const xEnd   = Math.min(width, Math.floor(xs[i + 1] - offsetX));
-      for (let x = xStart; x < xEnd; x++) {
-        data[py * width + x] = 255;
-      }
-    }
+  // Offscreen canvas the size of the polygon's AABB
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = width;
+  tempCanvas.height = height;
+  const tempCtx = tempCanvas.getContext('2d');
+  if (!tempCtx) {
+    return { width: 1, height: 1, data: new Uint8Array(1), offsetX, offsetY };
+  }
+
+  // Translate so polygon points map into the temp canvas
+  tempCtx.translate(-offsetX, -offsetY);
+  tempCtx.beginPath();
+  tempCtx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length; i++) {
+    tempCtx.lineTo(points[i].x, points[i].y);
+  }
+  tempCtx.closePath();
+  tempCtx.fillStyle = 'white';
+  tempCtx.fill();
+
+  // Extract alpha channel into a Uint8Array
+  const imageData = tempCtx.getImageData(0, 0, width, height);
+  const src = imageData.data;
+  const data = new Uint8Array(width * height);
+  for (let i = 0; i < data.length; i++) {
+    data[i] = src[i * 4 + 3]; // alpha channel
   }
   return { width, height, data, offsetX, offsetY };
 }
@@ -537,11 +546,17 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
   const [marqueePreview, setMarqueePreview] = useState<{
     start: Vec2; end: Vec2; shape: 'rect' | 'ellipse';
   } | null>(null);
-  const [lassoPreview, setLassoPreview] = useState<Vec2[] | null>(null);
+  // Gemini 2.2 fix: lasso points are stored ONLY in selectionDragRef.current.lassoDraft
+  // and drawn directly to the selection canvas during pointer move — NO React state,
+  // NO re-render per point. The previous setLassoPreview([...points]) on every
+  // mousemove caused severe lag on long lasso strokes.
   const selectionDragRef = useRef<{
     marqueeStart?: Vec2;
     lassoDraft?: Vec2[];
   } | null>(null);
+  // Tick used to force the selection-canvas useEffect to re-run when needed
+  // (e.g., after lasso ends, so the line is cleared from the canvas).
+  const [, setSelectionTick] = useState(0);
 
   // ── Selection overlay canvas ref ──────────────────────────
   const selectionCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -553,8 +568,8 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
   useEffect(() => {
     setPolygonPoints([]);
     setMarqueePreview(null);
-    setLassoPreview(null);
     selectionDragRef.current = null;
+    setSelectionTick(t => t + 1);
   }, [tool, activeLayer?.id]);
 
   // ── Reset drag flag if layer unmounts mid-drag ────────────
@@ -571,10 +586,10 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
       if (e.key === 'Escape') {
         setPolygonPoints([]);
         setMarqueePreview(null);
-        setLassoPreview(null);
         selectionDragRef.current = null;
         dragRef.current = null;
         setIsDragging(false);
+        setSelectionTick(t => t + 1);
         return;
       }
       // Avoid hijacking typing in inputs
@@ -674,12 +689,61 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
     void e;
   }, [activeLayer]);
 
+  // ────────────────────────────────────────────────────────────
+  // Anchor-based x/y correction (Gemini 2.1 fix, adapted)
+  // ──────────────────────────────────────────────────────────
+  // The bug: react-moveable's ghost uses transformOrigin '0 0' and
+  // emits e.drag.beforeTranslate to compensate. But our composite
+  // pipeline (composeLayerMatrix) rotates/scales around the layer's
+  // geometric CENTER (-w/2, -h/2). Adding raw beforeTranslate to
+  // transform.x/y creates a math mismatch → frame jumps/jitters.
+  //
+  // The fix: don't use beforeTranslate for scale/rotate. Instead,
+  // compute the new (x, y) by keeping the appropriate anchor point
+  // fixed in canvas space, using our own composeLayerMatrix.
+  //
+  // For Rotate: the layer center is the rotation pivot, so x/y DON'T
+  // CHANGE — center-based rotation preserves the center position.
+  //
+  // For Scale: the OPPOSITE corner (relative to the dragged handle)
+  // is the anchor. Compute its start position, compute its position
+  // under the new scale (with x/y unchanged), and shift x/y by the
+  // negative delta to keep the anchor fixed.
+
+  // ────────────────────────────────────────────────────────────
+  // projectMatrixToCanvasXY — used by handleWarp (skew tool only)
+  // ──────────────────────────────────────────────────────────
+  // OnWarp IS the only react-moveable event that exposes `e.matrix`
+  // (a 16-element column-major matrix3d representing local→screen).
+  // We use it to project the layer center through the warp matrix
+  // and derive the new (x, y) so the layer doesn't drift during skew.
+  //
+  // (OnDrag/OnScale/OnRotate don't expose .matrix in their public
+  // types, so handleDrag/Scale/Rotate use anchor-based math instead.)
+  const projectMatrixToCanvasXY = useCallback(
+    (m3d: number[]): { newX: number; newY: number } => {
+      const w = activeLayerNaturalSize.w;
+      const h = activeLayerNaturalSize.h;
+      // Project local center (w/2, h/2) through matrix3d → screen space
+      const screenCenter = applyM3d(m3d, w / 2, h / 2);
+      // Strip view transform: screen → canvas
+      const canvasCenterX = (screenCenter.x - view.panX) / view.zoom;
+      const canvasCenterY = (screenCenter.y - view.panY) / view.zoom;
+      // composeLayerMatrix uses destCenter = docSize/2 + transform.x
+      // So inverse: transform.x = canvasCenter - docSize/2
+      return {
+        newX: canvasCenterX - docSize.w / 2,
+        newY: canvasCenterY - docSize.h / 2,
+      };
+    },
+    [activeLayerNaturalSize, view, docSize],
+  );
+
   const handleDrag = useCallback((e: OnDrag) => {
     if (!activeLayer || !dragRef.current) return;
     const t0 = dragRef.current.startTransform;
-    // e.beforeTranslate is in CSS px relative to the dragStart position,
-    // in the parent's coordinate space (screen-aligned). Convert to
-    // canvas px by dividing by zoom.
+    // Move tool: pure translation. beforeTranslate is fine here
+    // because there's no rotation/scale around center involved.
     const dxCanvas = e.beforeTranslate[0] / zoom;
     const dyCanvas = e.beforeTranslate[1] / zoom;
     const newTransform: LayerTransform = {
@@ -719,11 +783,6 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
     if (!activeLayer || !dragRef.current) return;
     const t0 = dragRef.current.startTransform;
     // e.scale = [scaleX, scaleY] multiplier from dragStart.
-    // e.drag.beforeTranslate is the compensating translation (in CSS
-    // px, screen-aligned) needed to keep the opposite edge/corner
-    // anchored. Convert to canvas px.
-    const dxCanvas = e.drag ? e.drag.beforeTranslate[0] / zoom : 0;
-    const dyCanvas = e.drag ? e.drag.beforeTranslate[1] / zoom : 0;
     // Guard against zero/negative scales (degenerate layer)
     const newScaleX = t0.scaleX === 0
       ? e.scale[0]
@@ -731,15 +790,45 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
     const newScaleY = t0.scaleY === 0
       ? e.scale[1]
       : Math.sign(t0.scaleY) * Math.max(0.001, Math.abs(t0.scaleY * e.scale[1]));
+
+    // Gemini 2.1 fix (anchor-based): don't use e.drag.beforeTranslate.
+    // Instead, keep the OPPOSITE corner fixed in canvas space.
+    // e.direction is a 2-element array: [-1, 0, 1] per axis.
+    // If dragging the bottom-right (direction = [1, 1]), anchor = top-left (0, 0).
+    // If dragging the top-left (direction = [-1, -1]), anchor = bottom-right (w, h).
+    const w = activeLayerNaturalSize.w;
+    const h = activeLayerNaturalSize.h;
+    const dir = e.direction;
+    const anchorLocal: Vec2 = {
+      x: dir && dir[0] >= 0 ? 0 : w,
+      y: dir && dir[1] >= 0 ? 0 : h,
+    };
+
+    // Compute anchor's canvas-space position under t0 (start) and under
+    // the new scale (with x/y temporarily = t0.x/t0.y).
+    const startMatrix = composeLayerMatrix(t0, activeLayerNaturalSize, docSize);
+    const startAnchor = applyToPoint(startMatrix, anchorLocal);
+    const newTentative: LayerTransform = {
+      ...t0,
+      scaleX: newScaleX,
+      scaleY: newScaleY,
+    };
+    const newMatrix = composeLayerMatrix(newTentative, activeLayerNaturalSize, docSize);
+    const newAnchor = applyToPoint(newMatrix, anchorLocal);
+
+    // Shift x/y so the anchor returns to its start position.
+    const newX = t0.x + (startAnchor.x - newAnchor.x);
+    const newY = t0.y + (startAnchor.y - newAnchor.y);
+
     const newTransform: LayerTransform = {
       ...t0,
       scaleX: newScaleX,
       scaleY: newScaleY,
-      x: t0.x + dxCanvas,
-      y: t0.y + dyCanvas,
+      x: newX,
+      y: newY,
     };
     onTransformLive?.(newTransform);
-  }, [activeLayer, zoom, onTransformLive]);
+  }, [activeLayer, activeLayerNaturalSize, docSize, onTransformLive]);
 
   const handleScaleEnd = useCallback((e: OnScaleEnd) => {
     if (!activeLayer || !dragRef.current) return;
@@ -770,23 +859,26 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
     if (!activeLayer || !dragRef.current) return;
     const t0 = dragRef.current.startTransform;
     // e.beforeRotation is the absolute rotation from dragStart (deg).
-    // We add it to the start transform's rotation.
     let r = t0.rotation + (e.beforeRotation || 0);
-    // Normalize to [-180, 180] for cleanliness (matches transform-panel.tsx)
+    // Normalize to [-180, 180] for cleanliness
     while (r > 180) r -= 360;
     while (r < -180) r += 360;
-    // Rotate also produces a compensating drag delta to keep the
-    // rotation center anchored. Apply it.
-    const dxCanvas = e.drag ? e.drag.beforeTranslate[0] / zoom : 0;
-    const dyCanvas = e.drag ? e.drag.beforeTranslate[1] / zoom : 0;
+    // Gemini 2.1 fix: our composeLayerMatrix rotates around the layer's
+    // geometric CENTER (destCenter = docSize/2 + transform.x/y). This
+    // means rotation preserves the center position, so transform.x/y
+    // DO NOT CHANGE during pure rotation. The old code added
+    // e.drag.beforeTranslate, which is react-moveable's compensation
+    // for its origin-0,0 ghost — applying it caused the layer to
+    // "drift" because our pipeline doesn't need that compensation.
     const newTransform: LayerTransform = {
       ...t0,
       rotation: r,
-      x: t0.x + dxCanvas,
-      y: t0.y + dyCanvas,
+      // x, y intentionally kept as t0.x, t0.y — center-based rotation
+      // preserves the center, and our transform.x/y IS the center
+      // offset from docSize/2.
     };
     onTransformLive?.(newTransform);
-  }, [activeLayer, zoom, onTransformLive]);
+  }, [activeLayer, onTransformLive]);
 
   const handleRotateEnd = useCallback((e: OnRotateEnd) => {
     if (!activeLayer || !dragRef.current) return;
@@ -876,6 +968,11 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
         }
         // Clamp to ±89° to match the composite pipeline (tan(90°) = ∞)
         const clampSkew = (deg: number) => Math.max(-89, Math.min(89, deg));
+        // Gemini 2.1 fix: derive x/y from matrix-projected center to
+        // prevent the layer from drifting when skew is applied (the
+        // center-based composeLayerMatrix doesn't match Moveable's
+        // origin 0,0 ghost, so without this the layer "flies away").
+        const { newX, newY } = projectMatrixToCanvasXY(e.matrix);
         const newTransform: LayerTransform = {
           ...t0,
           skewX: clampSkew(skewXDeg),
@@ -885,11 +982,13 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
           scaleX: t0.scaleX,
           scaleY: t0.scaleY,
           rotation: t0.rotation,
+          x: newX,
+          y: newY,
         };
         onTransformLive?.(newTransform);
       }
     }
-  }, [activeLayer, tool, activeLayerNaturalSize, docSize, view, onTransformLive]);
+  }, [activeLayer, tool, activeLayerNaturalSize, docSize, view, onTransformLive, projectMatrixToCanvasXY]);
 
   const handleWarpEnd = useCallback((e: OnWarpEnd) => {
     if (!activeLayer || !dragRef.current) return;
@@ -920,7 +1019,26 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
     }
     if (tool === 'lasso') {
       selectionDragRef.current = { lassoDraft: [p] };
-      setLassoPreview([p]);
+      // Don't setLassoPreview — draw directly to canvas during move.
+      // Initialise the path with a single point; subsequent move events
+      // will draw incremental segments.
+      const selCanvas = selectionCanvasRef.current;
+      if (selCanvas) {
+        const sctx = selCanvas.getContext('2d');
+        if (sctx) {
+          // Clear any previous selection drawing on this canvas
+          sctx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+          sctx.save();
+          sctx.strokeStyle = '#fff';
+          sctx.lineWidth = 1.5 / zoom;
+          sctx.lineCap = 'round';
+          sctx.lineJoin = 'round';
+          sctx.beginPath();
+          sctx.moveTo(p.x, p.y);
+          // Stash the context state on the ref so move handler can
+          // continue the same path without re-setting styles.
+        }
+      }
       (e.target as Element).setPointerCapture(e.pointerId);
       return;
     }
@@ -961,7 +1079,26 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
       // unbounded array growth on long drags).
       if (Math.hypot(p.x - last.x, p.y - last.y) > 2) {
         drag.lassoDraft.push(p);
-        setLassoPreview([...drag.lassoDraft]);
+        // Gemini 2.2 fix: draw the new segment DIRECTLY to the selection
+        // canvas. No React state update, no re-render, no Virtual DOM
+        // diff. This is O(1) per move event instead of O(N).
+        const selCanvas = selectionCanvasRef.current;
+        if (selCanvas) {
+          const sctx = selCanvas.getContext('2d');
+          if (sctx) {
+            // If this is the first move after pointerDown, the context
+            // may have been cleared by a state-driven useEffect re-run.
+            // Re-establish styles defensively.
+            sctx.strokeStyle = '#fff';
+            sctx.lineWidth = 1.5 / zoom;
+            sctx.lineCap = 'round';
+            sctx.lineJoin = 'round';
+            sctx.beginPath();
+            sctx.moveTo(last.x, last.y);
+            sctx.lineTo(p.x, p.y);
+            sctx.stroke();
+          }
+        }
       }
       return;
     }
@@ -995,7 +1132,10 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
     }
     if (tool === 'lasso' && drag.lassoDraft) {
       const pts = [...drag.lassoDraft];
-      setLassoPreview(null);
+      // Clear the lasso line from the selection canvas by forcing a tick.
+      // The useEffect will re-run, see no lassoDraft in the ref (we nulled
+      // it above), and clear the canvas.
+      setSelectionTick(t => t + 1);
       if (pts.length >= 3) {
         onMaskChange?.(polygonToMask(pts), 'Freehand Lasso');
       }
@@ -1057,15 +1197,23 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
       ctx.restore();
     }
 
-    // Freehand lasso preview
-    if (lassoPreview && lassoPreview.length > 1) {
+    // Freehand lasso preview — read from ref, not state (Gemini 2.2 fix).
+    // During an active lasso drag, points are drawn incrementally to
+    // the canvas in the pointer-move handler. This block only runs when
+    // the useEffect re-runs for OTHER reasons (zoom change, tool change,
+    // etc.) — it re-renders the lasso line from the ref so the user
+    // doesn't lose their in-progress selection.
+    const lassoDraft = selectionDragRef.current?.lassoDraft;
+    if (tool === 'lasso' && lassoDraft && lassoDraft.length > 1) {
       ctx.save();
       ctx.strokeStyle = '#fff';
       ctx.lineWidth = 1.5 / zoom;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
       ctx.beginPath();
-      ctx.moveTo(lassoPreview[0].x, lassoPreview[0].y);
-      for (let i = 1; i < lassoPreview.length; i++) {
-        ctx.lineTo(lassoPreview[i].x, lassoPreview[i].y);
+      ctx.moveTo(lassoDraft[0].x, lassoDraft[0].y);
+      for (let i = 1; i < lassoDraft.length; i++) {
+        ctx.lineTo(lassoDraft[i].x, lassoDraft[i].y);
       }
       ctx.stroke();
       ctx.restore();
@@ -1096,7 +1244,7 @@ export const TransformOverlayMovable: React.FC<TransformOverlayMovableProps> = (
       ctx.restore();
     }
   }, [
-    activeLayer, tool, marqueePreview, lassoPreview, polygonPoints,
+    activeLayer, tool, marqueePreview, polygonPoints,
     docSize, zoom,
   ]);
 

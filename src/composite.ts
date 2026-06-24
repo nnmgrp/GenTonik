@@ -93,6 +93,19 @@ export interface CompositeContext {
    * only sees already-converted px values.
    */
   dpi?: number;
+  /**
+   * Optional: Adaptive perspective subdivision grid size (Gemini 2.3 fix).
+   * Controls the N×N triangle grid used by drawImageWithPerspective.
+   *
+   *   - During active perspective drag (live preview): pass 2 or 4
+   *     (8–32 triangles) for instant feedback.
+   *   - On pointer-up / commit / export: pass 8 or 16 (128–512 triangles)
+   *     for high-quality final render.
+   *
+   * If undefined, defaults to 8 (medium quality, used when no live drag
+   * is happening — e.g., initial load, undo/redo, layer ops).
+   */
+  perspectiveSubdivisions?: number;
 }
 
 // ────────────────────────────────────────────────────────────
@@ -577,10 +590,13 @@ function compositeSingleLayer(
   if (layer.transform.corners) {
     // Perspective path — bypass translate/rotate/scale/skew and
     // render via homography subdivision.
+    // Gemini 2.3 fix: use adaptive subdivisions from context.
+    // App.tsx sets this to 2 or 4 during live drag for instant
+    // feedback, and 8 or 16 on commit for quality.
     drawImageWithPerspective(
       destCtx, offscreen, renderW, renderH,
       layer.transform.corners,
-      8,  // subdivisions (8×8 = 128 triangles)
+      compositeCtx.perspectiveSubdivisions ?? 8,
     );
   } else {
     // Affine path — translate to the layer's destination center.

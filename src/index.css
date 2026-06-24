@@ -54,14 +54,6 @@
   --c-accent: #3b82f6;
   --c-accent-hover: #60a5fa;
   --c-accent-soft: rgba(59, 130, 246, 0.18);
-  --c-mask-overlay-bg: rgba(40, 40, 45, 0.95);
-  --c-mask-toolbar-shadow: 0 4px 16px rgba(0,0,0,0.4);
-  --c-debug-bg: rgba(20, 20, 24, 0.97);
-  --c-debug-border: #333;
-  --c-layer-active: rgba(59, 130, 246, 0.25);
-  --c-layer-thumb-bg: #0d1117;
-  --c-warning: #f59e0b;
-  --c-success: #10b981;
 }
 
 [data-theme="light"] {
@@ -446,5 +438,54 @@ body {
 .gt-popup-divider {
   height: 1px;
   margin: 4px 2px;
+  background: var(--c-border);
+}
+
+/* ============================================================
+   MenuBar dropdown menus (File / Edit / View / Image)
+   Gemini 2.4.3 — classic desktop dropdown style
+   ============================================================ */
+.gt-menu-dropdown {
+  background: var(--c-info-bg);
+  border: 1px solid var(--c-info-border);
+  border-radius: 4px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(0, 0, 0, 0.3);
+  padding: 4px 0;
+  user-select: none;
+}
+
+.gt-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 5px 12px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--c-text);
+  font-size: 12px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 60ms;
+}
+.gt-menu-item:hover:not(:disabled) {
+  background: var(--c-accent-soft);
+}
+.gt-menu-item:disabled:hover {
+  background: transparent;
+}
+.gt-menu-item .gt-menu-label {
+  flex: 1;
+  white-space: nowrap;
+}
+.gt-menu-item .gt-menu-shortcut {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 10px;
+  color: var(--c-text-dim);
+}
+.gt-menu-separator {
+  height: 1px;
+  margin: 4px 8px;
   background: var(--c-border);
 }
