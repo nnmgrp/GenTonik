@@ -10,8 +10,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@scena/matrix": "^1.1.1",
-    "@tauri-apps/api": "^2.11.1",
     "clsx": "2.1.1",
     "jszip": "^3.10.1",
     "react": "19.2.3",
@@ -22,11 +20,12 @@
   "devDependencies": {
     "@tailwindcss/vite": "4.1.17",
     "@tauri-apps/cli": "^2.10.1",
-    "@types/node": "22.19.17",
+    "@types/node": "^26.0.1",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "5.1.1",
     "tailwindcss": "4.1.17",
+    "twgl.js": "^7.0.0",
     "typescript": "5.9.3",
     "vite": "^7.3.2",
     "vite-plugin-singlefile": "2.3.0"

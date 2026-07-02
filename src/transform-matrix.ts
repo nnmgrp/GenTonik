@@ -41,6 +41,11 @@
 // ============================================================
 
 import type { LayerTransform, Vec2 } from './types';
+import {
+  computeHomography,
+  applyHomography,
+  invertHomography,
+} from './homography';
 
 /** 2D affine matrix as [a, b, c, d, e, f]. */
 export type Matrix = [number, number, number, number, number, number];
@@ -193,12 +198,29 @@ export function invertLayerMatrix(
   naturalSize: { w: number; h: number },
   docSize: { w: number; h: number },
 ): Matrix | null {
+  // When corners is set (perspective mode), there is no valid
+  // 2D affine inverse — the layer is rendered via homography.
+  // Callers should use canvasToLocal() instead, which correctly
+  // handles perspective transforms.
+  if (t.corners) {
+    return null;
+  }
   const m = composeLayerMatrix(t, naturalSize, docSize);
   return invert(m);
 }
 
 /**
  * Map a canvas-space point to layer-local-space using the layer transform.
+ *
+ * CRITICAL FIX (2026-06-28): When `t.corners` is set (perspective mode),
+ * the layer is rendered via homography, and the affine matrix inverse gives
+ * WRONG coordinates. This caused:
+ *   - Mask on FT layer freezing (wrong coords → huge canvas allocation)
+ *   - Selection on FT layer producing wrong shape
+ *   - Mask editor painting in wrong position
+ *
+ * Fix: when corners is set, use the homography inverse instead of the
+ * affine inverse.
  *
  * @returns {x, y} in layer-local pixels (0,0 = top-left of natural size),
  *          or null if the transform is degenerate.
@@ -209,6 +231,21 @@ export function canvasToLocal(
   naturalSize: { w: number; h: number },
   docSize: { w: number; h: number },
 ): Vec2 | null {
+  // Perspective mode: use homography inverse
+  if (t.corners) {
+    const srcQuad: [Vec2, Vec2, Vec2, Vec2] = [
+      { x: 0, y: 0 },
+      { x: naturalSize.w, y: 0 },
+      { x: naturalSize.w, y: naturalSize.h },
+      { x: 0, y: naturalSize.h },
+    ];
+    const H = computeHomography(srcQuad, t.corners);
+    if (!H) return null;
+    const invH = invertHomography(H);
+    if (!invH) return null;
+    return applyHomography(invH, canvasPoint);
+  }
+  // Affine mode: use matrix inverse
   const inv = invertLayerMatrix(t, naturalSize, docSize);
   if (!inv) return null;
   return applyToPoint(inv, canvasPoint);
@@ -394,3 +431,134 @@ export function decomposeWarpMatrix(
     skewY: (skewY * 180) / Math.PI,
   };
 }
+
+// ────────────────────────────────────────────────────────────
+// RESERVED: applyDeltaToLayer — для будущего multi-select
+// (Konva _fitNodesInto pattern, MIT, © Anton Lavrenov)
+// ────────────────────────────────────────────────────────────
+
+/**
+ * RESERVED для будущего multi-select — НЕ ИСПОЛЬЗУЕТСЯ в A1.
+ *
+ * Применяет "delta-матрицу" к слою, возвращая новый LayerTransform.
+ *
+ * Концепция заимствована из Konva Transformer._fitNodesInto (MIT):
+ *   delta = newTransform * oldTransform⁻¹
+ *   newLayerTransform = delta * oldLayerTransform
+ *
+ * Когда это понадобится:
+ *   • Multi-select: один delta применяется к нескольким слоям сразу
+ *   • Group transform: вращение группы слоёв как единого целого
+ *
+ * Сейчас не подключено — single-layer transform использует более
+ * прямой путь через composeLayerMatrix + handle anchor'ы.
+ *
+ * @param delta       матрица преобразования (например, rotate вокруг центра)
+ * @param layer       исходный LayerTransform
+ * @param naturalSize размер слоя
+ * @param docSize     размер документа
+ * @returns новый LayerTransform (исходный не мутируется)
+ *
+ * @example
+ * // Вращение всех слоёв группы на 30° вокруг центра документа:
+ * const center = { x: docSize.w / 2, y: docSize.h / 2 };
+ * const delta = rotateAroundPointMatrix(center.x, center.y, degToRad(30));
+ * const newLayers = selectedLayers.map(l => ({
+ *   ...l,
+ *   transform: applyDeltaToLayer(delta, l.transform, naturalSize, docSize)
+ * }));
+ */
+export function applyDeltaToLayer(
+  delta: Matrix,
+  layer: LayerTransform,
+  naturalSize: { w: number; h: number },
+  docSize: { w: number; h: number },
+): LayerTransform {
+  // 1. Старая forward-матрица слоя
+  const oldMatrix = composeLayerMatrix(layer, naturalSize, docSize);
+
+  // 2. Новая forward-матрица = delta * oldMatrix
+  const newMatrix = multiply(delta, oldMatrix);
+
+  // 3. Декомпозиция новой матрицы обратно в LayerTransform
+  //    (translation, scale, rotation, skew)
+  const decomposed = decomposeWarpMatrix(newMatrix);
+  if (!decomposed) {
+    // Degenerate — возвращаем исходный (без изменений)
+    return { ...layer };
+  }
+
+  // 4. Вычисляем новый x/y из translation новой матрицы.
+  //    composeLayerMatrix ставит destCenter = (docW/2 + x, docH/2 + y),
+  //    поэтому: x = newMatrix.e - docW/2, y = newMatrix.f - docH/2
+  const newX = newMatrix[4] - docSize.w / 2;
+  const newY = newMatrix[5] - docSize.h / 2;
+
+  return {
+    ...layer,
+    x: newX,
+    y: newY,
+    scaleX: decomposed.scaleX,
+    scaleY: decomposed.scaleY,
+    rotation: decomposed.rotation,
+    // decomposeWarpMatrix возвращает skewY (skewX сворачивается в 0).
+    // Для полного round-trip нужно хранить corners, но для delta-применения
+    // аффинной дельты это приемлемо.
+    skewX: 0,
+    skewY: decomposed.skewY,
+    // corners не переносим — delta-применение работает только в affine mode
+    corners: null,
+  };
+}
+
+/**
+ * A3: Perspective-aware screen-to-local coordinate mapping.
+ *
+ * Maps screen-px (CSS) → layer-local px (the layer's natural coordinate space,
+ * where (0,0) is top-left of the layer's natural bbox).
+ *
+ * Used by:
+ *   - mask-editor.tsx (brush painting under perspective)
+ *   - transform-overlay-canvas.tsx (selection tools under perspective)
+ *
+ * Under perspective (layer.transform.corners !== null):
+ *   1. screen → canvas-px via invert(viewMatrix)
+ *   2. canvas-px → layer-local via invertHomography(computeHomography(srcQuad, corners))
+ *
+ * Under affine (corners === null):
+ *   Falls back to existing screenToLocal (affine path).
+ *
+ * @returns layer-local point, or null if transform is degenerate.
+ */
+export function screenToLocalPerspective(
+  screenPoint: Vec2,
+  view: { zoom: number; panX: number; panY: number },
+  t: LayerTransform,
+  naturalSize: { w: number; h: number },
+  docSize: { w: number; h: number },
+): Vec2 | null {
+  // 1. screen → canvas-px
+  const viewM = composeViewMatrix(view);
+  const invView = invert(viewM);
+  if (!invView) return null;
+  const canvasP = applyToPoint(invView, screenPoint);
+
+  // 2. canvas-px → layer-local
+  if (t.corners) {
+    const srcQuad: [Vec2, Vec2, Vec2, Vec2] = [
+      { x: 0, y: 0 },
+      { x: naturalSize.w, y: 0 },
+      { x: naturalSize.w, y: naturalSize.h },
+      { x: 0, y: naturalSize.h },
+    ];
+    const H = computeHomography(srcQuad, t.corners);
+    if (!H) return null;
+    const invH = invertHomography(H);
+    if (!invH) return null;
+    return applyHomography(invH, canvasP);
+  }
+
+  // 3. Affine fallback
+  return canvasToLocal(canvasP, t, naturalSize, docSize);
+}
+

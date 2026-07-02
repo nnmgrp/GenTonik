@@ -220,6 +220,40 @@ body {
   opacity: 1;
 }
 
+/* A2.1a-fix-2: Tooltip positioned ABOVE the button (for buttons inside
+ * scrolling containers like Layers panel, where right-side tooltip would
+ * be clipped by overflow).
+ *
+ * Used by: SelectionModeButton (New / Add / Subtract / Intersect).
+ * Could also be used by other buttons in Layers panel if they get
+ * data-tooltip in the future.
+ */
+.gt-tool-btn.gt-tooltip-top[data-tooltip]::after {
+  left: 50%;
+  top: auto;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+}
+
+/* Small arrow pointing down (optional polish) */
+.gt-tool-btn.gt-tooltip-top[data-tooltip]::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: auto;
+  bottom: calc(100% + 2px);
+  transform: translateX(-50%);
+  border: 4px solid transparent;
+  border-top-color: rgba(15, 15, 18, 0.96);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 120ms ease 80ms;
+  z-index: 50;
+}
+.gt-tool-btn.gt-tooltip-top[data-tooltip]:hover::before {
+  opacity: 1;
+}
+
 /* Toolbox group divider */
 .gt-tool-divider {
   height: 1px;
@@ -342,6 +376,23 @@ body {
   paint-order: stroke;
   stroke: rgba(0, 0, 0, 0.35);
   stroke-width: 0.4;
+}
+
+/* ============================================================
+   CanvasScrollbar — Photoshop-style custom scrollbar
+   ============================================================ */
+.gt-scrollbar-thumb {
+  /* Thumb background set inline via CSS var --thumb-bg.
+     On hover, swap to --thumb-hover-bg (brighter) — Photoshор behaviour. */
+  background: var(--thumb-bg);
+}
+.gt-scrollbar-thumb:hover {
+  background: var(--thumb-hover-bg);
+}
+.gt-scrollbar-thumb:active {
+  /* While dragging — keep hover color (slightly brighter still). */
+  background: var(--thumb-hover-bg);
+  cursor: grabbing;
 }
 
 /* ============================================================
@@ -489,3 +540,19 @@ body {
   margin: 4px 8px;
   background: var(--c-border);
 }
+
+/* ============================================================
+   A2.1a: Selection tool SVG icon overrides
+   ============================================================ */
+.gt-tool-btn svg {
+  display: block;
+  width: 20px;
+  height: 20px;
+  pointer-events: none; /* click goes to button */
+}
+
+.gt-tool-btn:disabled svg {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+

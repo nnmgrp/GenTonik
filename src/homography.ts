@@ -334,17 +334,59 @@ export function quadSignedArea(quad: readonly [Vec2, Vec2, Vec2, Vec2]): number 
  *
  * Used to reject invalid perspective states before computing homography.
  */
+/**
+ * Check if a quad is degenerate (any 3 points collinear, or zero area)
+ * OR non-convex / self-intersecting (butterfly / hourglass shape).
+ * A3-fix-1: convexity check via cross-product sign consistency.
+ */
 export function isQuadDegenerate(quad: readonly [Vec2, Vec2, Vec2, Vec2]): boolean {
-  if (Math.abs(quadSignedArea(quad)) < 1) return true; // < 1 px²
-  // Check each triple for collinearity
+  if (Math.abs(quadSignedArea(quad)) < 1) return true;
+  let firstSign = 0;
   for (let i = 0; i < 4; i++) {
     const a = quad[i];
     const b = quad[(i + 1) % 4];
     const c = quad[(i + 2) % 4];
     const cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
     if (Math.abs(cross) < 1) return true;
+    const sign = cross > 0 ? 1 : -1;
+    if (firstSign === 0) firstSign = sign;
+    else if (firstSign !== sign) return true;
   }
   return false;
+}
+
+// ─────────────────────────────────────────────────────────────
+// BUG-4 FIX: Self-intersecting quad normalization
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Check if two line segments AB and CD intersect (proper intersection).
+ */
+function segmentsIntersect(a: Vec2, b: Vec2, c: Vec2, d: Vec2): boolean {
+  const cross = (o: Vec2, p: Vec2, q: Vec2) =>
+    (p.x - o.x) * (q.y - o.y) - (p.y - o.y) * (q.x - o.x);
+  const d1 = cross(c, d, a);
+  const d2 = cross(c, d, b);
+  const d3 = cross(a, b, c);
+  const d4 = cross(a, b, d);
+  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+      ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Normalize a self-intersecting quad (butterfly/hourglass) by swapping
+ * the crossed corners. If the quad is already convex, returns it unchanged.
+ */
+export function normalizeCorners(quad: readonly [Vec2, Vec2, Vec2, Vec2]): [Vec2, Vec2, Vec2, Vec2] {
+  const [a, b, c, d] = quad;
+  // Check diagonals a-c (TL-BR) and b-d (TR-BL). If they cross, swap TR and BL.
+  if (segmentsIntersect(a, c, b, d)) {
+    return [a, d, c, b];
+  }
+  return [a, b, c, d];
 }
 
 // ────────────────────────────────────────────────────────────

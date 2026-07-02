@@ -75,7 +75,7 @@ import {
 
 import type { Layer, LayerMask } from './types';
 import {
-  screenToLocal,
+  screenToLocalPerspective,
   composeLayerMatrix,
   composeViewMatrix,
   multiply,
@@ -242,7 +242,7 @@ export function MaskEditor({
   onClose,
   className,
   style,
-}: MaskEditorProps): JSX.Element {
+}: MaskEditorProps) {
   // ── Tool state ─────────────────────────────────────────
   const [tool, setTool] = useState<MaskTool>('brush');
   const [brush, setBrush] = useState<BrushSettings>({
@@ -357,7 +357,7 @@ export function MaskEditor({
       const screenX = clientX - rect.left;
       const screenY = clientY - rect.top;
       // Full inverse: screen → canvas-pixel → layer-local.
-      return screenToLocal(
+      return screenToLocalPerspective(
         { x: screenX, y: screenY },
         viewTransform,
         layerTransform,
@@ -1111,6 +1111,10 @@ function extractMaskFromCanvas(
       width,
       height,
       data: new Uint8Array(width * height),
+      // Mask editor always paints full-size at (0,0) layer-local — see
+      // types.ts L242-258 for the offsetX/offsetY contract.
+      offsetX: 0,
+      offsetY: 0,
       invert,
     };
   }
@@ -1121,7 +1125,7 @@ function extractMaskFromCanvas(
     // Use alpha channel only (we always wrote RGB=255).
     data[i] = src[i * 4 + 3];
   }
-  return { type: 'painted', width, height, data, invert };
+  return { type: 'painted', width, height, data, offsetX: 0, offsetY: 0, invert };
 }
 
 // ────────────────────────────────────────────────────────────
@@ -1148,7 +1152,7 @@ const labelStyle: CSSProperties = {
   fontSize: 12,
 };
 
-function Divider(): JSX.Element {
+function Divider() {
   return (
     <div
       style={{

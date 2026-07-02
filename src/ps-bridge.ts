@@ -157,20 +157,34 @@ export function detectEnvironment(): BridgeEnvironment {
 }
 
 // ────────────────────────────────────────────────────────────
-// Use new Function to bypass Vite's static analysis of the dynamic import
-const _dynamicImport = new Function('m', 'return import(m)');
+// Tauri API lazy loaders
+// ────────────────────────────────────────────────────────────
+//
+// ВАЖНО: мы НЕ используем `typeof import('@tauri-apps/api/dialog')` для
+// типизации, потому что TypeScript тогда пытается статически резолвить
+// модуль (и падает, т.к. @tauri-apps/api не установлен в web-сборке).
+// Вместо этого:
+//   1. Объявляем минимальные интерфейсы TauriDialogApi / TauriFsApi
+//      только для тех методов, которые реально используем.
+//   2. Динамический импорт прячем через `new Function('m', 'return import(m)')`,
+//      чтобы ни TypeScript, ни Vite не видели строку '@tauri-apps/api/...'
+//      при статическом анализе. Это полностью эквивалентно `/* @vite-ignore */`,
+//      но дополнительно защищает и от tsc, а не только от Vite.
 
 export interface TauriDialogApi {
-  open(options?: any): Promise<string | string[] | null>;
-  save(options?: any): Promise<string | null>;
+  open(options?: unknown): Promise<string | string[] | null>;
+  save(options?: unknown): Promise<string | null>;
 }
 
 export interface TauriFsApi {
   readBinaryFile(path: string): Promise<Uint8Array | number[]>;
   readTextFile(path: string): Promise<string>;
-  writeFile(path: string, contents: any): Promise<void>;
+  writeFile(path: string, contents: unknown): Promise<void>;
   writeTextFile(path: string, contents: string): Promise<void>;
 }
+
+// Скрытый динамический импорт — невидимый для статического анализа TS и Vite.
+const _dynamicImport = new Function('m', 'return import(m)') as (m: string) => Promise<unknown>;
 
 /**
  * Dynamically import @tauri-apps/api/dialog. Returns null if not
@@ -179,7 +193,7 @@ export interface TauriFsApi {
 async function loadTauriDialog(): Promise<TauriDialogApi | null> {
   if (detectEnvironment() !== 'tauri') return null;
   try {
-    return await _dynamicImport('@tauri-apps/api/dialog');
+    return (await _dynamicImport('@tauri-apps/api/dialog')) as TauriDialogApi;
   } catch (err) {
     debug.warn('bridge', 'Tauri dialog API unavailable, falling back to browser', err);
     return null;
@@ -189,7 +203,7 @@ async function loadTauriDialog(): Promise<TauriDialogApi | null> {
 async function loadTauriFs(): Promise<TauriFsApi | null> {
   if (detectEnvironment() !== 'tauri') return null;
   try {
-    return await _dynamicImport('@tauri-apps/api/fs');
+    return (await _dynamicImport('@tauri-apps/api/fs')) as TauriFsApi;
   } catch (err) {
     debug.warn('bridge', 'Tauri fs API unavailable, falling back to browser', err);
     return null;
@@ -293,7 +307,10 @@ export function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
       try {
         const dataUrl = canvas.toDataURL('image/png');
         const bytes = base64ToBytes(dataUrl.split(',')[1] ?? '');
-        resolve(new Blob([bytes], { type: 'image/png' }));
+        // TS: Uint8Array<ArrayBufferLike> несовместим с BlobPart в ES2022 lib.
+        // Используем bytes.buffer с явным приведением к ArrayBuffer (безопасно:
+        // bytes только что создан через new Uint8Array(n), buffer = весь ArrayBuffer).
+        resolve(new Blob([bytes.buffer as ArrayBuffer], { type: 'image/png' }));
       } catch (err) {
         reject(err);
       }
@@ -488,8 +505,11 @@ export class PngBridge {
     const pngPath = selected as string;
 
     const bytes = await fs.readBinaryFile(pngPath);
-    const blob = new Blob([new Uint8Array(bytes)], { type: 'image/png' });
     const uint8 = new Uint8Array(bytes);
+    // BlobPart в ES2022 lib не принимает Uint8Array<ArrayBufferLike> напрямую;
+    // используем .buffer с приведением к ArrayBuffer (безопасно — только что
+    // создан new Uint8Array(bytes), buffer = весь ArrayBuffer).
+    const blob = new Blob([uint8.buffer as ArrayBuffer], { type: 'image/png' });
     const dims = probePngDimensions(uint8);
     if (!dims) throw new Error(`Not a valid PNG: ${pngPath}`);
 
@@ -788,7 +808,7 @@ export function createBridgeHook(react: {
   return function useBridgeSession(): BridgeSessionSnapshot {
     const [, force] = react.useReducer((x: number) => x + 1, 0);
     const ref = react.useReducer(
-      (s: BridgeSessionSnapshot, n: BridgeSessionSnapshot) => n,
+      (_: BridgeSessionSnapshot, n: BridgeSessionSnapshot) => n,
       bridgeSession.getSnapshot(),
     );
     react.useEffect(() => {

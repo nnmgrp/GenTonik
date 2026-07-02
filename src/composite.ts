@@ -40,10 +40,11 @@
 import {
   Layer,
   LayerMask,
-  ScreentoneParams,
   Vec2,
+  ColorProfile,
   blendToCompositeOp,
   getLayerNaturalSize,
+  SelectionEntry,
 } from './types';
 import { renderScreentone } from './engine';
 import {
@@ -126,21 +127,48 @@ export interface CompositeContext {
 const canvasPool: HTMLCanvasElement[] = [];
 
 function acquireCanvas(width: number, height: number): HTMLCanvasElement {
-  // Find the smallest pooled canvas that fits, or create a new one.
-  let best: HTMLCanvasElement | null = null;
+  // A2.2.4: Find the smallest pooled canvas that fits, REMOVE IT FROM
+  // THE POOL, and return it. Previously this function returned a
+  // reference WITHOUT removing it from the pool, which caused a
+  // catastrophic aliasing bug:
+  //
+  //   1. compositeSingleLayer calls acquireCanvas(W, H) → returns A
+  //      (A is still in pool)
+  //   2. compositeSingleLayer renders white bg + dots into A
+  //   3. applyPaintedMask calls acquireCanvas(W, H) → returns A AGAIN
+  //      (A is still in pool, fits the size)
+  //   4. Setting A.width = W (even to the same value) CLEARS the canvas
+  //      per HTML spec — dots and white bg are GONE
+  //   5. putImageData writes mask data into A
+  //   6. ctx.drawImage(A, 0, 0) onto A is a no-op (drawing canvas
+  //      onto itself is undefined behavior, no-op in Chrome)
+  //   7. destCtx.drawImage(A, 0, 0) draws only the mask onto dest
+  //   8. User sees: "solid white rectangle in shape of selection"
+  //      instead of the actual screentone pattern
+  //
+  // Fix: splice the canvas out of the pool when acquired. This
+  // guarantees that nested acquireCanvas calls (e.g. inside
+  // applyPaintedMask while compositeSingleLayer holds an offscreen)
+  // return DIFFERENT canvases.
+  let bestIdx = -1;
   let bestArea = Infinity;
-  for (const c of canvasPool) {
+  for (let i = 0; i < canvasPool.length; i++) {
+    const c = canvasPool[i];
     if (c.width >= width && c.height >= height) {
       const area = c.width * c.height;
       if (area < bestArea) {
-        best = c;
+        bestIdx = i;
         bestArea = area;
       }
     }
   }
-  const canvas = best ?? document.createElement('canvas');
+  const canvas = bestIdx >= 0
+    ? canvasPool.splice(bestIdx, 1)[0]
+    : document.createElement('canvas');
   // Set size even for reused canvases — drawImage with mismatched
-  // sizes silently produces wrong output.
+  // sizes silently produces wrong output. NOTE: setting width/height
+  // always clears the canvas per HTML spec, even if the value is
+  // unchanged.
   canvas.width = Math.max(1, Math.ceil(width));
   canvas.height = Math.max(1, Math.ceil(height));
   return canvas;
@@ -187,7 +215,9 @@ function renderLayerContent(
       if (!layer.params) return;
       // renderScreentone fills the canvas with colorBg first,
       // then draws the pattern on top.
-      renderScreentone(ctx, width, height, layer.params);
+      const originX = (compositeCtx.docWidth / 2 + layer.transform.x) - width / 2;
+      const originY = (compositeCtx.docHeight / 2 + layer.transform.y) - height / 2;
+      renderScreentone(ctx, width, height, layer.params, originX, originY);
       break;
     }
     case 'image': {
@@ -206,6 +236,31 @@ function renderLayerContent(
       ctx.fillStyle = layer.solidColor;
       ctx.fillRect(0, 0, width, height);
       break;
+    }
+    case 'transparent': {
+      // No content to render — the layer is intentionally empty.
+      // Any mask applied to this layer is still processed downstream
+      // (applyPaintedMask / canvasSpacePolygon clip in compositeSingleLayer).
+      // Returning without drawing leaves the layer's offscreen buffer
+      // fully transparent, which is exactly what we want.
+      return;
+    }
+    case 'text': {
+      // v2.9 STUB: Text layers are not rendered by the core.
+      // A future TextRenderer (registered via PluginRegistry) will handle
+      // this. For now, check if a plugin has registered a renderer for
+      // 'text' layers; if so, call it. Otherwise, no-op.
+      //
+      // We can't import pluginRegistry here (would create a circular dep
+      // types.ts → composite.ts → types.ts). The plugin check happens in
+      // the caller (compositeSingleLayer) which CAN import types.ts.
+      // Here we just return — the caller handles plugin delegation.
+      return;
+    }
+    case 'vector': {
+      // v2.9 STUB: Vector layers are not rendered by the core.
+      // Same as 'text' — a future VectorRenderer will handle this.
+      return;
     }
   }
 }
@@ -303,27 +358,55 @@ function applyShapeMask(
  *   1. Create a temp canvas at mask dimensions.
  *   2. Build an ImageData where R=G=B=255 and A=mask.data[i].
  *      (Color doesn't matter — only alpha is used by 'destination-in'.)
- *   3. drawImage the temp canvas onto the layer canvas with
- *      'destination-in' (or 'destination-out' if invert=true).
+ *   3. drawImage the temp canvas onto the layer canvas at
+ *      (mask.offsetX, mask.offsetY) with 'destination-in'
+ *      (or 'destination-out' if invert=true).
  *
  * We can't use putImageData directly because it ignores
  * globalCompositeOperation. drawImage with a temp canvas is the
  * standard workaround.
  *
  * The mask may be smaller than the layer (e.g., user painted only
- * a region). The mask is anchored at (0,0) in layer-local space —
- * caller must position it via the mask's width/height relative to
- * the layer's natural size.
+ * a region). `offsetX/offsetY` anchor the mask's (0,0) in LAYER-LOCAL
+ * space (the layer's natural-size coordinate system, BEFORE the layer
+ * transform is applied — see compositeSingleLayer L577-578).
+ *
+ * Mask editor always paints full-size → offsetX=offsetY=0.
+ * Selection tools compute the polygon in canvas-px, then invert the
+ * layer matrix to map into layer-local space → mask is anchored at
+ * the floor-left of the inverse-transformed polygon's AABB.
+ *
+ * Before A2-fix-mask-transform (2026-06-25), this function always
+ * drew at (0,0) → lasso/marquee masks landed in the top-left of the
+ * layer regardless of where the user selected.
  */
 function applyPaintedMask(
   ctx: CanvasRenderingContext2D,
   mask: Extract<LayerMask, { type: 'painted' }>,
 ): void {
   const { width: mw, height: mh, data, invert } = mask;
+  // offsetX/offsetY default to 0 for legacy masks (mask editor, .ora import).
+  // Selection tools always set them explicitly.
+  const ox = (mask as { offsetX?: number }).offsetX ?? 0;
+  const oy = (mask as { offsetY?: number }).offsetY ?? 0;
   if (mw <= 0 || mh <= 0 || data.length !== mw * mh) return;
 
   // Build an RGBA ImageData from the single-channel alpha array.
   const tempCanvas = acquireCanvas(mw, mh);
+
+  // A2.2.4: defense-in-depth — detect aliasing between tempCanvas and
+  // the destination ctx's canvas. If acquireCanvas ever returns the
+  // SAME canvas that ctx belongs to (e.g. due to a pool regression),
+  // setting tempCanvas.width below would CLEAR the destination,
+  // wiping out the just-rendered layer content. Throw with a clear
+  // message instead of silently producing a "solid white rectangle".
+  const destCanvas = ctx.canvas;
+  if (destCanvas && tempCanvas === destCanvas) {
+    releaseCanvas(tempCanvas);
+    console.error('[A2.2.4] applyPaintedMask: tempCanvas aliases destination canvas — acquireCanvas pool bug!');
+    return;
+  }
+
   const tempCtx = tempCanvas.getContext('2d');
   if (!tempCtx) {
     releaseCanvas(tempCanvas);
@@ -343,10 +426,100 @@ function applyPaintedMask(
 
   ctx.save();
   ctx.globalCompositeOperation = invert ? 'destination-out' : 'destination-in';
-  ctx.drawImage(tempCanvas, 0, 0);
+  ctx.drawImage(tempCanvas, ox, oy);
   ctx.restore();
 
   releaseCanvas(tempCanvas);
+}
+
+/**
+ * Build a 'painted' LayerMask of FIXED dimensions from a closed polygon
+ * in layer-local coordinates. Used by "New Layer from Selection" (A2.2):
+ * the mask size = layer natural size (bbox of original selection), and
+ * the polygon is drawn inside that canvas with alpha=255 inside, alpha=0
+ * outside.
+ *
+ * Unlike rasterizePolygon (which computes its own tight AABB), this
+ * function lets the caller specify width/height explicitly — so the
+ * mask can match the layer's natural size exactly, even if the polygon
+ * doesn't fill the entire bbox (alpha=0 outside polygon is fine).
+ *
+ * @param points   — polygon vertices in layer-local coords (already
+ *                   shifted so the polygon is positioned correctly
+ *                   inside the [0..width, 0..height] canvas).
+ * @param width    — mask width in px (typically = layer naturalWidth).
+ * @param height   — mask height in px (typically = layer naturalHeight).
+ * @param offsetX  — mask origin offset in layer-local space.
+ *                   Pass 0 if mask aligns with layer bounds (A2.2 case).
+ * @param offsetY  — mask origin offset in layer-local space.
+ * @param invert   — if true, alpha=255 outside polygon, alpha=0 inside.
+ * @returns LayerMask of type 'painted'.
+ */
+export function polygonToMaskFixedSize(
+  points: Vec2[],
+  width: number,
+  height: number,
+  offsetX: number = 0,
+  offsetY: number = 0,
+  invert: boolean = false,
+): LayerMask {
+  // Guard against unbounded allocation
+  if (width > MAX_MASK_DIM || height > MAX_MASK_DIM) {
+    console.warn(`[polygonToMaskFixedSize] dimensions ${width}×${height} exceed MAX_MASK_DIM=${MAX_MASK_DIM}, clamping`);
+    width = Math.min(width, MAX_MASK_DIM);
+    height = Math.min(height, MAX_MASK_DIM);
+  }
+  if (width <= 0 || height <= 0 || points.length < 3) {
+    return {
+      type: 'painted',
+      width: Math.max(1, width),
+      height: Math.max(1, height),
+      data: new Uint8Array(Math.max(1, width * height)),
+      offsetX,
+      offsetY,
+      invert,
+    };
+  }
+
+  const tempCanvas = acquireCanvas(width, height);
+  const tempCtx = tempCanvas.getContext('2d');
+  if (!tempCtx) {
+    releaseCanvas(tempCanvas);
+    return {
+      type: 'painted',
+      width, height,
+      data: new Uint8Array(width * height),
+      offsetX, offsetY,
+      invert,
+    };
+  }
+
+  // Draw polygon at (offsetX, offsetY) origin in temp canvas
+  tempCtx.beginPath();
+  tempCtx.moveTo(points[0].x + offsetX, points[0].y + offsetY);
+  for (let i = 1; i < points.length; i++) {
+    tempCtx.lineTo(points[i].x + offsetX, points[i].y + offsetY);
+  }
+  tempCtx.closePath();
+  tempCtx.fillStyle = 'white';
+  tempCtx.fill();
+
+  // Extract alpha channel
+  const imageData = tempCtx.getImageData(0, 0, width, height);
+  const src = imageData.data;
+  const data = new Uint8Array(width * height);
+  for (let i = 0; i < data.length; i++) {
+    data[i] = src[i * 4 + 3];
+  }
+
+  releaseCanvas(tempCanvas);
+  return {
+    type: 'painted',
+    width, height,
+    data,
+    offsetX, offsetY,
+    invert,
+  };
 }
 
 /**
@@ -540,6 +713,8 @@ function compositeSingleLayer(
   layer: Layer,
   compositeCtx: CompositeContext,
 ): void {
+
+
   if (!layer.visible || layer.opacity <= 0) return;
 
   const naturalSize = getLayerNaturalSize(layer, {
@@ -554,9 +729,16 @@ function compositeSingleLayer(
   // For solid layers specifically, we render them at doc size so
   // the transform behaves intuitively (scaling a solid by 2x = 2x
   // the area filled, not 2x of a 1px dot).
+  //
+  // Transparent layers get the same docSize override: they have no
+  // intrinsic content, but we still need a sane render box so that
+  // transform handles, masks, and the canvas-space clip work correctly.
+  // v2.9: text/vector layers also get docSize override (no intrinsic size
+  // until a renderer measures their content).
   let renderW = naturalSize.w;
   let renderH = naturalSize.h;
-  if (layer.type === 'solid') {
+  if (layer.type === 'solid' || layer.type === 'transparent'
+      || layer.type === 'text' || layer.type === 'vector') {
     renderW = compositeCtx.docWidth;
     renderH = compositeCtx.docHeight;
   }
@@ -576,10 +758,34 @@ function compositeSingleLayer(
   renderLayerContent(offCtx, layer, renderW, renderH, compositeCtx);
 
   // ── Step 3: Apply mask (in layer-local space) ──────────
-  applyMask(offCtx, layer.mask, renderW, renderH);
+  // PRESERVE-PERSPECTIVE: if the mask has canvasSpacePolygon, it's a
+  // canvas-space mask applied AFTER perspective (as a clip on destCtx).
+  // In that case, we skip the layer-local painted mask here and apply
+  // the clip in step 4 instead.
+  const hasCanvasSpaceMask = layer.mask?.type === 'painted' && layer.mask.canvasSpacePolygon;
+  if (!hasCanvasSpaceMask) {
+    applyMask(offCtx, layer.mask, renderW, renderH);
+  }
 
   // ── Step 4: drawImage onto destination with transform ──
   destCtx.save();
+
+  // PRESERVE-PERSPECTIVE: apply canvas-space mask as a clip BEFORE drawing.
+  // This clips the destination to the polygon in canvas-pixel space,
+  // so the visible area matches the selection outline exactly regardless
+  // of the layer's perspective deformation.
+  if (hasCanvasSpaceMask && layer.mask?.type === 'painted' && layer.mask.canvasSpacePolygon) {
+    const poly = layer.mask.canvasSpacePolygon;
+    if (poly.length >= 3) {
+      destCtx.beginPath();
+      destCtx.moveTo(poly[0].x, poly[0].y);
+      for (let i = 1; i < poly.length; i++) {
+        destCtx.lineTo(poly[i].x, poly[i].y);
+      }
+      destCtx.closePath();
+      destCtx.clip();
+    }
+  }
 
   // Blend mode + opacity. globalAlpha multiplies with per-pixel
   // alpha, so opacity=0.5 → half-transparent layer.
@@ -698,6 +904,194 @@ export function compositeSingleLayerPublic(
 }
 
 // ────────────────────────────────────────────────────────────
+// v2.9.1: Color profile conversion (RGB ↔ Gray)
+// ────────────────────────────────────────────────────────────
+//
+// Converts all layers in a document from one color profile to another.
+// This is a DESTRUCTIVE operation — pixel data is rewritten. The caller
+// should pushHistory before calling.
+//
+// Conversions:
+//   RGB → Gray:  Y = 0.299R + 0.587G + 0.114B (ITU-R BT.601 luminance)
+//                Hex colors → grayscale hex (R=G=B=Y)
+//                Image layers → per-pixel luminance via canvas
+//   Gray → RGB:  Replicate Y to R=G=B=Y
+//                Hex colors stay the same (already grayscale-equivalent)
+//                Image layers → per-pixel replicate via canvas
+//
+// Solid and screentone layers only carry color STRINGS (hex), so conversion
+// is cheap (parse hex → compute → format hex). Image layers carry pixel
+// data as data URLs, so we decode → convert pixels → re-encode.
+//
+// CMYK is NOT supported (stub) — the function throws if either profile is
+// 'cmyk8'. WebToonTools will handle CMYK conversion.
+
+/** Parse a #rrggbb hex string into {r, g, b} (0-255). Returns null on failure. */
+function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return null;
+  const v = parseInt(m[1], 16);
+  return { r: (v >> 16) & 0xff, g: (v >> 8) & 0xff, b: v & 0xff };
+}
+
+/** Format {r, g, b} (0-255) as #rrggbb. */
+function rgbToHex(r: number, g: number, b: number): string {
+  const to2 = (n: number) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
+  return `#${to2(r)}${to2(g)}${to2(b)}`;
+}
+
+/** Convert a hex color to grayscale using ITU-R BT.601 luminance. */
+function hexToGrayscale(hex: string): string {
+  const rgb = hexToRgb(hex);
+  if (!rgb) return hex; // can't parse — leave as-is
+  const y = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+  return rgbToHex(y, y, y);
+}
+
+/**
+ * Convert an image layer's pixel data from RGB to grayscale or vice versa.
+ * Returns a NEW data URL with converted pixels. The original imageSrc is
+ * not modified.
+ *
+ * Implementation: decode data URL → canvas → getImageData → per-pixel
+ * convert → putImageData → canvas.toDataURL.
+ */
+function convertImageDataUrl(
+  imageSrc: string,
+  toGray: boolean,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth || img.width;
+      canvas.height = img.naturalHeight || img.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) { reject(new Error('no 2d context')); return; }
+      ctx.drawImage(img, 0, 0);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imageData.data;
+      if (toGray) {
+        // RGB → Gray: Y = 0.299R + 0.587G + 0.114B
+        for (let i = 0; i < data.length; i += 4) {
+          const y = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          data[i] = y;
+          data[i + 1] = y;
+          data[i + 2] = y;
+          // alpha unchanged
+        }
+      } else {
+        // Gray → RGB: already R=G=B in a grayscale image, so this is a no-op
+        // for true grayscale. But if the image had color (user imported a
+        // color PNG into a gray doc then converts back to RGB), we leave
+        // the pixels as-is — they keep whatever values they had.
+        // (Replicating Y to RGB would only matter if the source was truly
+        // single-channel, which Canvas2D doesn't expose — it's always RGBA.)
+      }
+      ctx.putImageData(imageData, 0, 0);
+      resolve(canvas.toDataURL('image/png'));
+    };
+    img.onerror = () => reject(new Error('failed to load image for conversion'));
+    img.src = imageSrc;
+  });
+}
+
+/**
+ * Convert all layers in a document from `fromProfile` to `toProfile`.
+ *
+ * Returns a NEW layers array — does not mutate the input. The caller is
+ * responsible for setLayers + pushHistory.
+ *
+ * For image layers, the conversion is ASYNC (pixel processing). This
+ * function returns a Promise.
+ *
+ * @throws if either profile is 'cmyk8' (not supported in core).
+ */
+export async function convertLayersColorProfile(
+  layers: readonly Layer[],
+  fromProfile: ColorProfile,
+  toProfile: ColorProfile,
+): Promise<Layer[]> {
+  if (fromProfile === toProfile) return layers.slice();
+  if (fromProfile === 'cmyk8' || toProfile === 'cmyk8') {
+    throw new Error('CMYK conversion is not supported in GenToniK core — use WebToonTools.');
+  }
+
+  const toGray = toProfile === 'gray8';
+  const fromGray = fromProfile === 'gray8';
+
+  const result: Layer[] = [];
+  for (const layer of layers) {
+    const newLayer: Layer = { ...layer, updatedAt: Date.now() };
+
+    // Solid layer: convert solidColor hex
+    if (layer.type === 'solid' && layer.solidColor) {
+      newLayer.solidColor = toGray ? hexToGrayscale(layer.solidColor) : layer.solidColor;
+    }
+
+    // Screentone layer: convert colorPattern + colorBg hex
+    if (layer.type === 'screentone' && layer.params) {
+      const newParams = { ...layer.params };
+      if (toGray) {
+        newParams.colorPattern = hexToGrayscale(newParams.colorPattern);
+        newParams.colorBg = hexToGrayscale(newParams.colorBg);
+      }
+      // Gray → RGB: colors stay as-is (they were already grayscale hex).
+      // If the user had a color hex in a gray doc (unusual), we leave it —
+      // the screentone generator handles color regardless of profile.
+      newLayer.params = newParams;
+    }
+
+    // Image layer: convert pixel data (async)
+    if (layer.type === 'image' && layer.imageSrc) {
+      try {
+        // Only convert if there's an actual change needed:
+        // - RGB → Gray: always convert (luminance)
+        // - Gray → RGB: no-op (pixels already correct in RGBA canvas)
+        if (toGray) {
+          newLayer.imageSrc = await convertImageDataUrl(layer.imageSrc, true);
+        }
+        // fromGray → RGB: leave imageSrc as-is
+      } catch (err) {
+        // If conversion fails, keep the original image — better than
+        // losing the layer entirely.
+        console.warn('[GenToniK] Failed to convert image layer, keeping original:', err);
+      }
+    }
+
+    // text/vector/solid/transparent: no color payload to convert
+    // (textData.color is a hex string — convert it too for consistency)
+    if (layer.type === 'text' && layer.textData) {
+      newLayer.textData = {
+        ...layer.textData,
+        color: toGray ? hexToGrayscale(layer.textData.color) : layer.textData.color,
+      };
+    }
+    if (layer.type === 'vector' && layer.vectorData) {
+      const vd = { ...layer.vectorData };
+      if (vd.defaultFill) vd.defaultFill = toGray ? hexToGrayscale(vd.defaultFill) : vd.defaultFill;
+      if (vd.defaultStroke) vd.defaultStroke = toGray ? hexToGrayscale(vd.defaultStroke) : vd.defaultStroke;
+      vd.shapes = vd.shapes.map(s => {
+        if (s.kind === 'line') {
+          return { ...s, stroke: s.stroke ? (toGray ? hexToGrayscale(s.stroke) : s.stroke) : s.stroke };
+        } else {
+          return {
+            ...s,
+            fill: s.fill ? (toGray ? hexToGrayscale(s.fill) : s.fill) : s.fill,
+            stroke: s.stroke ? (toGray ? hexToGrayscale(s.stroke) : s.stroke) : s.stroke,
+          };
+        }
+      });
+      newLayer.vectorData = vd;
+    }
+
+    result.push(newLayer);
+  }
+
+  return result;
+}
+
+// ────────────────────────────────────────────────────────────
 // Helpers for cache invalidation (used by App.tsx)
 // ────────────────────────────────────────────────────────────
 
@@ -731,7 +1125,7 @@ export function layerContentFingerprint(
   const maskPart = layer.mask
     ? layer.mask.type === 'shape'
       ? `shape:${layer.mask.shape}:${layer.mask.bounds.left},${layer.mask.bounds.top},${layer.mask.bounds.right},${layer.mask.bounds.bottom}:${layer.mask.feather}:${layer.mask.invert}`
-      : `painted:${layer.mask.width}x${layer.mask.height}:${layer.mask.invert}`
+      : `painted:${layer.mask.width}x${layer.mask.height}:${(layer.mask as { offsetX?: number }).offsetX ?? 0},${(layer.mask as { offsetY?: number }).offsetY ?? 0}:${layer.mask.invert}`
     : 'nomask';
 
   const contentPart =
@@ -739,7 +1133,13 @@ export function layerContentFingerprint(
       ? `screentone:${JSON.stringify(layer.params)}`
       : layer.type === 'image'
         ? `image:${layer.imageSrc}`
-        : `solid:${layer.solidColor}`;
+        : layer.type === 'transparent'
+          ? `transparent`           // no payload — fingerprint is constant per layer.id
+          : layer.type === 'text'
+            ? `text:${JSON.stringify(layer.textData)}`  // v2.9: text content
+            : layer.type === 'vector'
+              ? `vector:${JSON.stringify(layer.vectorData)}`  // v2.9: vector shapes
+              : `solid:${layer.solidColor}`;
 
   return `${layer.id}|${contentPart}|${naturalSize.w}x${naturalSize.h}|${maskPart}`;
 }
@@ -766,7 +1166,10 @@ export function getLayerCanvasBounds(
 
   let renderW = naturalSize.w;
   let renderH = naturalSize.h;
-  if (layer.type === 'solid') {
+  // v2.9: text/vector layers also get docSize override (they have no
+  // intrinsic size until a renderer measures their content).
+  if (layer.type === 'solid' || layer.type === 'transparent'
+      || layer.type === 'text' || layer.type === 'vector') {
     renderW = compositeCtx.docWidth;
     renderH = compositeCtx.docHeight;
   }
@@ -911,8 +1314,431 @@ export function isPointInLayer(
   return lx >= 0 && lx <= renderW && ly >= 0 && ly <= renderH;
 }
 
+/**
+ * A2.1b: Rasterize a polygon into a Uint8Array alpha mask at a FIXED size
+ * and offset. Used by apply-as-mask to combine multiple selection entries
+ * with boolean ops — all entries must rasterize to the SAME dimensions
+ * for pixel-wise combine to work.
+ *
+ * Points must already be in the target coordinate space (e.g. layer-local).
+ * (offsetX, offsetY) is the top-left of the output mask in that space.
+ *
+ * Returns Uint8Array of length width*height, values 0 or 255
+ * (anti-aliasing not supported — keep simple for boolean combine).
+ */
+export const MAX_MASK_DIM = 8192;
+
+export function rasterizePolygonAtSize(
+  points: Vec2[],
+  width: number,
+  height: number,
+  offsetX: number,
+  offsetY: number,
+): Uint8Array {
+  // Guard against unbounded allocation (e.g. when layerLocalPolygon
+  // has huge coordinates from incorrect inverse on FT layers).
+  if (width > MAX_MASK_DIM || height > MAX_MASK_DIM) {
+    console.warn(`[rasterizePolygonAtSize] dimensions ${width}×${height} exceed MAX_MASK_DIM=${MAX_MASK_DIM}, clamping`);
+    width = Math.min(width, MAX_MASK_DIM);
+    height = Math.min(height, MAX_MASK_DIM);
+  }
+  const data = new Uint8Array(width * height);
+  if (points.length < 3 || width <= 0 || height <= 0) return data;
+
+  // Use a temp canvas to rasterize, then extract alpha channel.
+  const tempCanvas = acquireCanvas(width, height);
+  const tempCtx = tempCanvas.getContext('2d');
+  if (!tempCtx) {
+    releaseCanvas(tempCanvas);
+    return data;
+  }
+
+  tempCtx.clearRect(0, 0, width, height);
+  tempCtx.translate(-offsetX, -offsetY);
+  tempCtx.beginPath();
+  tempCtx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length; i++) {
+    tempCtx.lineTo(points[i].x, points[i].y);
+  }
+  tempCtx.closePath();
+  tempCtx.fillStyle = 'white';
+  tempCtx.fill();
+
+  const imageData = tempCtx.getImageData(0, 0, width, height);
+  const src = imageData.data;
+  for (let i = 0; i < data.length; i++) {
+    data[i] = src[i * 4 + 3]; // alpha channel
+  }
+  releaseCanvas(tempCanvas);
+  return data;
+}
+
+// ────────────────────────────────────────────────────────────
+// Contour tracing (marching squares)
+// ────────────────────────────────────────────────────────────
+
+/**
+ * A2.1b-fix: Marching squares contour tracer.
+ *
+ * Given a binary mask (Uint8Array, values 0 or 255), returns an array of
+ * polygon contours. Each contour is a closed polygon (Vec2[]). The first
+ * contour is the outer boundary of the largest connected component;
+ * subsequent contours may be additional outer boundaries (multiple
+ * disjoint components) or holes (inside an outer boundary).
+ *
+ * Polygons are in mask-local coordinates (0,0 = top-left of mask).
+ * Caller adds (offsetX, offsetY) to convert to target space.
+ */
+export function traceMaskContour(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  offsetX: number = 0,
+  offsetY: number = 0,
+): Vec2[][] {
+  if (width < 2 || height < 2 || mask.length < width * height) return [];
+
+  const THRESHOLD = 128;
+
+  // Build binary grid (1 = inside, 0 = outside). Add 1px transparent
+  // border so boundary cells at the edge of the mask still trace correctly.
+  const W = width + 2;
+  const H = height + 2;
+  const grid = new Uint8Array(W * H);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      grid[(y + 1) * W + (x + 1)] = mask[y * width + x] > THRESHOLD ? 1 : 0;
+    }
+  }
+
+  // Canonical marching squares lookup table:
+  const cases: number[][][] = [
+    [],               // 0: 0000
+    [[3, 0]],         // 1: 0001
+    [[0, 1]],         // 2: 0010
+    [[3, 1]],         // 3: 0011
+    [[1, 2]],         // 4: 0100
+    [[3, 0], [1, 2]], // 5: 0101
+    [[0, 2]],         // 6: 0110
+    [[3, 2]],         // 7: 0111
+    [[2, 3]],         // 8: 1000
+    [[0, 2]],         // 9: 1001
+    [[0, 1], [2, 3]], // 10: 1010
+    [[1, 2]],         // 11: 1011
+    [[3, 1]],         // 12: 1100
+    [[0, 1]],         // 13: 1101
+    [[3, 0]],         // 14: 1110
+    []                // 15: 1111
+  ];
+
+  interface Segment { a: Vec2; b: Vec2; }
+  const segments: Segment[] = [];
+
+  const edgePoint = (cellX: number, cellY: number, edge: number): Vec2 => {
+    const mx = cellX - 1;
+    const my = cellY - 1;
+    switch (edge) {
+      case 0: return { x: mx + 0.5, y: my };       // top
+      case 1: return { x: mx + 1,   y: my + 0.5 }; // right
+      case 2: return { x: mx + 0.5, y: my + 1 };   // bottom
+      case 3: return { x: mx,       y: my + 0.5 }; // left
+      default: return { x: mx, y: my };
+    }
+  };
+
+  for (let cy = 0; cy < H - 1; cy++) {
+    for (let cx = 0; cx < W - 1; cx++) {
+      const tl = grid[cy * W + cx];
+      const tr = grid[cy * W + (cx + 1)];
+      const br = grid[(cy + 1) * W + (cx + 1)];
+      const bl = grid[(cy + 1) * W + cx];
+      const idx = (tl << 0) | (tr << 1) | (br << 2) | (bl << 3);
+
+      const segs = cases[idx];
+      if (!segs || segs.length === 0) continue;
+      for (const [ea, eb] of segs) {
+        segments.push({
+          a: edgePoint(cx, cy, ea),
+          b: edgePoint(cx, cy, eb),
+        });
+      }
+    }
+  }
+
+  const used = new Uint8Array(segments.length);
+  const contours: Vec2[][] = [];
+  const EPS = 0.01;
+
+  for (let i = 0; i < segments.length; i++) {
+    if (used[i]) continue;
+    const contour: Vec2[] = [segments[i].a, segments[i].b];
+    used[i] = 1;
+    let current = segments[i].b;
+
+    // Walk forward
+    while (true) {
+      let found = -1;
+      for (let j = 0; j < segments.length; j++) {
+        if (used[j]) continue;
+        const s = segments[j];
+        if (Math.abs(s.a.x - current.x) < EPS && Math.abs(s.a.y - current.y) < EPS) {
+          found = j; break;
+        }
+        if (Math.abs(s.b.x - current.x) < EPS && Math.abs(s.b.y - current.y) < EPS) {
+          segments[j] = { a: s.b, b: s.a };
+          found = j; break;
+        }
+      }
+      if (found === -1) break;
+      used[found] = 1;
+      current = segments[found].b;
+      if (Math.abs(current.x - contour[0].x) < EPS && Math.abs(current.y - contour[0].y) < EPS) {
+        break;
+      }
+      contour.push(current);
+    }
+
+    for (const p of contour) {
+      p.x += offsetX;
+      p.y += offsetY;
+    }
+
+    const simplified = simplifyContour(contour, 0.5);
+    if (simplified.length >= 3) contours.push(simplified);
+  }
+
+  return contours;
+}
+
+function simplifyContour(points: Vec2[], epsilon: number): Vec2[] {
+  if (points.length < 3) return points;
+  const keep = new Array(points.length).fill(false);
+  keep[0] = true;
+  keep[points.length - 1] = true;
+
+  const stack: [number, number][] = [[0, points.length - 1]];
+  while (stack.length > 0) {
+    const [s, e] = stack.pop()!;
+    let maxD = 0;
+    let maxI = -1;
+    const a = points[s];
+    const b = points[e];
+    for (let i = s + 1; i < e; i++) {
+      const d = perpDist(points[i], a, b);
+      if (d > maxD) { maxD = d; maxI = i; }
+    }
+    if (maxD > epsilon && maxI !== -1) {
+      keep[maxI] = true;
+      stack.push([s, maxI]);
+      stack.push([maxI, e]);
+    }
+  }
+
+  const result: Vec2[] = [];
+  for (let i = 0; i < points.length; i++) {
+    if (keep[i]) result.push(points[i]);
+  }
+  return result;
+}
+
+function perpDist(p: Vec2, a: Vec2, b: Vec2): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  if (dx === 0 && dy === 0) {
+    const ddx = p.x - a.x;
+    const ddy = p.y - a.y;
+    return Math.sqrt(ddx * ddx + ddy * ddy);
+  }
+  const t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy);
+  const projX = a.x + t * dx;
+  const projY = a.y + t * dy;
+  const ddx = p.x - projX;
+  const ddy = p.y - projY;
+  return Math.sqrt(ddx * ddx + ddy * ddy);
+}
+
+// ────────────────────────────────────────────────────────────
+// BUG-3 FIX: Sutherland-Hodgman polygon clipping
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Clip a convex/concave subject polygon against a CONVEX clip polygon (rectangle).
+ *
+ * Sutherland-Hodgman algorithm: for each edge of the clip rectangle, walk the
+ * subject polygon and keep only the parts inside that edge. Intersections are
+ * computed exactly.
+ *
+ * Used by handleApplySelectionAsMask to clip the selection polygon (in
+ * layer-local space) to the layer's natural bounds [0, w] × [0, h]. This
+ * prevents the inverse-perspective from mapping out-of-quad canvas points to
+ * extreme layer-local coordinates, which previously produced huge mask
+ * bounding boxes (e.g. 7798×6002) and triggered the MAX_MASK_DIM guard.
+ *
+ * @param subject  The polygon to clip (array of {x, y}).
+ * @param bounds   The clip rectangle as {left, top, right, bottom} (inclusive).
+ * @returns New array of points = the clipped polygon. May be empty if the
+ *          subject is entirely outside bounds.
+ */
+export function clipPolygonToRect(
+  subject: Vec2[],
+  bounds: { left: number; top: number; right: number; bottom: number },
+): Vec2[] {
+  if (subject.length < 3) return [];
+
+  // Sutherland-Hodgman against each of the 4 clip edges.
+  // Each edge is defined by a point on the edge and the inward normal.
+  // We clip in order: left, right, bottom, top.
+  // (Note: y increases downward — "top" edge has smaller y, "bottom" has larger.)
+
+  type Edge = { point: Vec2; normal: Vec2; inside: (p: Vec2) => boolean };
+  const edges: Edge[] = [
+    // Left edge: x = bounds.left, inward normal = (+1, 0)
+    { point: { x: bounds.left, y: 0 }, normal: { x: 1, y: 0 },
+      inside: (p) => p.x >= bounds.left - 1e-9 },
+    // Right edge: x = bounds.right, inward normal = (-1, 0)
+    { point: { x: bounds.right, y: 0 }, normal: { x: -1, y: 0 },
+      inside: (p) => p.x <= bounds.right + 1e-9 },
+    // Bottom edge: y = bounds.bottom, inward normal = (0, -1)
+    { point: { x: 0, y: bounds.bottom }, normal: { x: 0, y: -1 },
+      inside: (p) => p.y <= bounds.bottom + 1e-9 },
+    // Top edge: y = bounds.top, inward normal = (0, +1)
+    { point: { x: 0, y: bounds.top }, normal: { x: 0, y: 1 },
+      inside: (p) => p.y >= bounds.top - 1e-9 },
+  ];
+
+  let output = subject.slice();
+
+  for (const edge of edges) {
+    if (output.length === 0) break;
+    const input = output;
+    output = [];
+    const S = input[input.length - 1]; // start with last point
+
+    let prevInside = edge.inside(S);
+    let prev = S;
+
+    for (let i = 0; i < input.length; i++) {
+      const curr = input[i];
+      const currInside = edge.inside(curr);
+
+      if (currInside) {
+        if (!prevInside) {
+          // Entering: compute intersection
+          const inter = lineSegIntersect(prev, curr, edge);
+          if (inter) output.push(inter);
+        }
+        output.push(curr);
+      } else if (prevInside) {
+        // Leaving: compute intersection
+        const inter = lineSegIntersect(prev, curr, edge);
+        if (inter) output.push(inter);
+      }
+      // else: both outside, skip
+
+      prev = curr;
+      prevInside = currInside;
+    }
+  }
+
+  return output;
+}
+
+/**
+ * Compute intersection of line segment (p1→p2) with an infinite clip edge.
+ * The edge is defined by a point and inward normal. Returns the intersection
+ * point, or null if the segment is parallel to the edge (no unique intersection).
+ */
+function lineSegIntersect(
+  p1: Vec2,
+  p2: Vec2,
+  edge: { point: Vec2; normal: Vec2 },
+): Vec2 | null {
+  // Line segment: P = p1 + t*(p2-p1), t ∈ [0, 1]
+  // Edge plane: dot(P - edgePoint, edgeNormal) = 0
+  // Solve for t:
+  //   dot(p1 + t*(p2-p1) - edgePoint, normal) = 0
+  //   dot(p1 - edgePoint, normal) + t * dot(p2-p1, normal) = 0
+  //   t = -dot(p1 - edgePoint, normal) / dot(p2-p1, normal)
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const denom = dx * edge.normal.x + dy * edge.normal.y;
+  if (Math.abs(denom) < 1e-12) return null; // parallel
+
+  const ex = p1.x - edge.point.x;
+  const ey = p1.y - edge.point.y;
+  const numer = ex * edge.normal.x + ey * edge.normal.y;
+  const t = -numer / denom;
+
+  return {
+    x: p1.x + t * dx,
+    y: p1.y + t * dy,
+  };
+}
+
+/**
+ * A2.1b-fix: Compute combined selection mask from multi-entry ActiveSelection.
+ */
+export function computeCombinedSelectionMask(
+  entries: SelectionEntry[],
+): { mask: Uint8Array; width: number; height: number; offsetX: number; offsetY: number } | null {
+  if (entries.length === 0) return null;
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const entry of entries) {
+    for (const p of entry.layerLocalPolygon) {
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y > maxY) maxY = p.y;
+    }
+  }
+  
+  minX = Math.floor(minX) - 1;
+  minY = Math.floor(minY) - 1;
+  maxX = Math.ceil(maxX) + 1;
+  maxY = Math.ceil(maxY) + 1;
+
+  const width = maxX - minX;
+  const height = maxY - minY;
+  if (width <= 0 || height <= 0) return null;
+
+  // Guard against unbounded allocation on FT layers with wrong inverse.
+  if (width > MAX_MASK_DIM || height > MAX_MASK_DIM) {
+    console.warn(`[computeCombinedSelectionMask] dimensions ${width}×${height} exceed MAX_MASK_DIM=${MAX_MASK_DIM}, clamping`);
+    const clampW = Math.min(width, MAX_MASK_DIM);
+    const clampH = Math.min(height, MAX_MASK_DIM);
+    const mask = new Uint8Array(clampW * clampH);
+    return { mask, width: clampW, height: clampH, offsetX: minX, offsetY: minY };
+  }
+
+  const mask = new Uint8Array(width * height);
+
+  for (const entry of entries) {
+    const entryMask = rasterizePolygonAtSize(
+      entry.layerLocalPolygon,
+      width, height,
+      minX, minY,
+    );
+    for (let i = 0; i < mask.length; i++) {
+      const src = entryMask[i] > 128;
+      const dst = mask[i] > 128;
+      let result: boolean;
+      switch (entry.op) {
+        case 'new':       result = src; break;
+        case 'add':       result = dst || src; break;
+        case 'subtract':  result = dst && !src; break;
+        case 'intersect': result = dst && src; break;
+        default:          result = dst;
+      }
+      mask[i] = result ? 255 : 0;
+    }
+  }
+
+  return { mask, width, height, offsetX: minX, offsetY: minY };
+}
+
 // ────────────────────────────────────────────────────────────
 // Re-exports for convenience
 // ────────────────────────────────────────────────────────────
 
-export type { ScreentoneParams } from './types';
+export type { ScreentoneParams, SelectionEntry } from './types';

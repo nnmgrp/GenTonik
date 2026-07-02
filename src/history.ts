@@ -21,7 +21,7 @@
 // Framework-agnostic. Subscribe() lets React re-render on history changes.
 // ============================================================
 
-import type { Layer } from './types';
+import type { Layer, ActiveSelection } from './types';
 
 // ────────────────────────────────────────────────────────────
 // Types
@@ -34,6 +34,12 @@ import type { Layer } from './types';
  * with adjacent snapshots wherever possible (structural sharing). Do NOT
  * mutate the array or any Layer inside it; treat the whole snapshot as
  * read-only.
+ *
+ * `activeSelection` is the committed selection at snapshot time (or null
+ * if no selection was active). Included so undo/redo correctly restores
+ * marching-ants state — previously selections were not tracked, so undoing
+ * a "Mask from Sel" left the selection visible even though the mask was
+ * reverted, which was confusing.
  */
 export interface DocumentSnapshot {
   /** Layer list, bottom-to-top. */
@@ -42,6 +48,8 @@ export interface DocumentSnapshot {
   readonly docSize: { readonly width: number; readonly height: number };
   /** Active layer ID at snapshot time, or null if none active. */
   readonly activeLayerId: string | null;
+  /** Committed selection at snapshot time, or null if none. */
+  readonly activeSelection: ActiveSelection | null;
   /** Human-readable action label for UI ("Add Layer", "Paint Mask", …). */
   readonly label: string;
   /** Snapshot creation time (ms epoch). */
@@ -361,17 +369,25 @@ export class HistoryManager {
  * Layer objects inside are NOT cloned — they are shared by reference. This
  * is intentional and safe AS LONG AS Layer is treated as immutable
  * (always create a new Layer object when changing a field, never mutate).
+ *
+ * `activeSelection` is shallow-copied (entries array cloned, but the
+ * SelectionEntry objects inside are shared). This is safe because
+ * SelectionEntry is treated as immutable too.
  */
 export function makeSnapshot(
   layers: readonly Layer[],
   docSize: { width: number; height: number },
   activeLayerId: string | null,
   label: string,
+  activeSelection: ActiveSelection | null = null,
 ): Omit<DocumentSnapshot, 'timestamp'> {
   return {
     layers: layers.slice(),
     docSize: { width: docSize.width, height: docSize.height },
     activeLayerId,
+    activeSelection: activeSelection
+      ? { entries: activeSelection.entries.slice() }
+      : null,
     label,
   };
 }

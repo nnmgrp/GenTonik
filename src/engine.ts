@@ -172,7 +172,10 @@ export function renderScreentone(
   width: number,
   height: number,
   params: ScreentoneParams,
+  originX: number = 0,
+  originY: number = 0,
 ): void {
+
   const {
     patternType,
     dotShape,
@@ -216,6 +219,13 @@ export function renderScreentone(
   const rgbPat = hexToRgb(colorPattern);
   const rgbBg = hexToRgb(colorBg);
 
+  // A2.1b-fix: Phase shift for global grid alignment.
+  // When a localized layer is rendered (layer's bbox is offset from
+  // document origin), the screentone pattern should align with the
+  // global document grid — not restart from local (0,0).
+  const phaseX = originX !== 0 ? ((originX % spacingX) + spacingX) % spacingX : 0;
+  const phaseY = originY !== 0 ? ((originY % spacingY) + spacingY) % spacingY : 0;
+
   // Background fill
   ctx.fillStyle = colorBg;
   ctx.fillRect(0, 0, width, height);
@@ -243,7 +253,7 @@ export function renderScreentone(
   // Apply canvas rotation transform — everything below draws in
   // the rotated local frame, centered at origin.
   ctx.save();
-  ctx.translate(cx, cy);
+  ctx.translate(cx + phaseX, cy + phaseY);
   ctx.rotate(rotCanvasRad);
 
   // Determine the polygon shape used by the main pattern.

@@ -75,7 +75,7 @@ export type SelectionToolId =
   | 'lasso'
   | 'polygonal';
 
-export type ToolId = TransformToolId | SelectionToolId | 'none';
+export type ToolId = TransformToolId | SelectionToolId | 'zoom' | 'bucket' | 'none';
 
 export interface ToolState {
   tool: ToolId;
@@ -134,6 +134,59 @@ const clamp = (x: number, lo: number, hi: number): number =>
   x < lo ? lo : x > hi ? hi : x;
 
 const clampSkew = (deg: number): number => clamp(deg, -89, 89);
+
+// ────────────────────────────────────────────────────────────
+// QUAD WINDING / SELF-INTERSECTION HELPERS
+// Used by perspective-corner drag to keep the quad non-self-
+// intersecting even when the user drags a corner across the
+// opposite edge (TL past BR, etc.). Without this, drawImageWith-
+// Perspective produces a mirrored / doubled / broken render.
+// ────────────────────────────────────────────────────────────
+
+/** 2D cross product of vectors (o→a) and (o→b). */
+function cross3(o: Vec2, a: Vec2, b: Vec2): number {
+  return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+}
+
+/**
+ * Standard segment-intersection test (Strasbourg / computational-geometry
+ * classic). Returns true iff segments a-b and c-d properly cross (not just
+ * touch at an endpoint).
+ */
+function segmentsIntersect(a: Vec2, b: Vec2, c: Vec2, d: Vec2): boolean {
+  const d1 = cross3(c, d, a);
+  const d2 = cross3(c, d, b);
+  const d3 = cross3(a, b, c);
+  const d4 = cross3(a, b, d);
+  return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+         ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+}
+
+/**
+ * Given a quad [TL, TR, BR, BL], detect if it has become self-intersecting
+ * (a "butterfly"/"hourglass" shape) and if so, swap the two pairs of corners
+ * so the quad returns to a valid non-self-intersecting winding.
+ *
+ * Two failure modes are handled:
+ *   • Vertical flip: TL→TR crosses BL→BR (top and bottom edges cross).
+ *     Fix: swap TL↔BL and TR↔BR.
+ *   • Horizontal flip: TR→BR crosses TL→BL (left and right edges cross).
+ *     Fix: swap TL↔TR and BL↔BR.
+ *
+ * This mirrors Photoshop's behaviour when dragging a perspective corner
+ * through the opposite side: the quad silently "flips through itself"
+ * rather than collapsing into a degenerate butterfly.
+ */
+function normalizeCorners(q: [Vec2, Vec2, Vec2, Vec2]): [Vec2, Vec2, Vec2, Vec2] {
+  const [tl, tr, br, bl] = q;
+  if (segmentsIntersect(tl, tr, bl, br)) {
+    return [bl, br, tr, tl];
+  }
+  if (segmentsIntersect(tr, br, tl, bl)) {
+    return [tr, tl, bl, br];
+  }
+  return q;
+}
 
 /**
  * Forward transform a local-space point (relative to layer natural center)
@@ -459,6 +512,11 @@ function polygonToMask(points: Vec2[], invert: boolean = false): LayerMask {
       width: 1,
       height: 1,
       data: new Uint8Array([0]),
+      // A2-fix-mask-transform (2026-06-25): offsetX/offsetY required by type.
+      // This file is dead code (not imported anywhere); minimal change to
+      // satisfy tsc. See transform-overlay-canvas.tsx for the canonical impl.
+      offsetX: 0,
+      offsetY: 0,
       invert,
     };
   }
@@ -468,6 +526,8 @@ function polygonToMask(points: Vec2[], invert: boolean = false): LayerMask {
     width: r.width,
     height: r.height,
     data: r.data,
+    offsetX: r.offsetX,
+    offsetY: r.offsetY,
     invert,
   };
 }
@@ -956,7 +1016,14 @@ export const TransformPanel: React.FC<TransformPanelProps> = ({
       if (idx >= 0) {
         const arr: Vec2[] = [baseCorners[0], baseCorners[1], baseCorners[2], baseCorners[3]];
         arr[idx] = { x: p.x, y: p.y };
-        next = { ...t0, corners: [arr[0], arr[1], arr[2], arr[3]] };
+        // A3-fix-1: if the user dragged a corner across the opposite edge
+        // (TL past BR, etc.), the quad becomes self-intersecting ("butterfly"
+        // shape) and the perspective renderer breaks (mirrored / doubled
+        // triangles). normalizeCorners swaps adjacent corner pairs so the
+        // quad returns to a valid non-self-intersecting winding — this is
+        // the same behaviour Photoshop uses for perspective corner drag.
+        const normalized = normalizeCorners([arr[0], arr[1], arr[2], arr[3]]);
+        next = { ...t0, corners: normalized };
       }
     }
 
@@ -1169,16 +1236,15 @@ export const TransformPanel: React.FC<TransformPanelProps> = ({
         ctx.stroke();
       }
 
-      // If corners is null, show a hint that the layer is in affine mode
-      if (!activeLayer.transform.corners) {
-        ctx.fillStyle = 'rgba(255, 200, 100, 0.9)';
-        ctx.font = `${12 / viewportScale}px ui-sans-serif`;
-        ctx.textBaseline = 'bottom';
-        ctx.fillText(
-          'Affine mode — drag a corner to enter perspective',
-          tl.x, tl.y - 6 / viewportScale,
-        );
-      }
+      // A3-fix-1: removed canvas-drawn "Affine mode — drag a corner..."
+      // hint. The hint was a free-floating yellow text rendered directly
+      // on the overlay canvas, with no visual anchor (no pill, no icon,
+      // no border) — users reported it as an unexplained "приписка сверху"
+      // that nobody notices. The same information is now surfaced as a
+      // visible highlighted DOM badge in the Properties panel (see the
+      // <div> block in the JSX render that renders АФФИННЫЙ РЕЖИМ when
+      // tool === 'perspective' && !activeLayer.transform.corners).
+
       ctx.restore();
     }
 
@@ -1311,6 +1377,14 @@ export const TransformPanel: React.FC<TransformPanelProps> = ({
         ...({ '--tw': 0 } as React.CSSProperties),
       }}
     >
+      {/* A3-fix-1: keyframes for the AFFINE badge pulse animation.
+          Injected once per panel mount; idempotent if React re-renders. */}
+      <style>{`
+        @keyframes tk-affine-hint-pulse {
+          0%, 100% { box-shadow: 0 0 0 1px rgba(249, 168, 37, 0.25), 0 0 6px rgba(249, 168, 37, 0.30); }
+          50%      { box-shadow: 0 0 0 1px rgba(249, 168, 37, 0.55), 0 0 12px rgba(249, 168, 37, 0.55); }
+        }
+      `}</style>
       {/* Toolbar — pointer-events: auto */}
       <div
         style={{
@@ -1384,6 +1458,34 @@ export const TransformPanel: React.FC<TransformPanelProps> = ({
           }}>
             <span>PERSPECTIVE MODE</span>
             <span>corners set</span>
+          </div>
+        )}
+        {/* A3-fix-1: replaced the canvas-drawn "Affine mode — drag a corner..."
+            hint with this visible DOM badge. It only appears when the Free
+            (perspective) tool is active but the layer is still in affine mode
+            (corners === null) — exactly the state in which the old canvas hint
+            was drawn. The badge is highlighted (amber background, pulsing
+            border animation) so the user actually notices it, instead of the
+            previous "невидимое" free-floating yellow text. */}
+        {activeLayer && tool === 'perspective' && !activeLayer.transform.corners && (
+          <div style={{
+            marginTop: 4,
+            padding: '4px 8px',
+            background: 'linear-gradient(90deg, #3a2a10, #4a3017)',
+            border: '1px solid #f9a825',
+            borderRadius: 3,
+            color: '#ffd166',
+            fontSize: 10,
+            lineHeight: 1.3,
+            boxShadow: '0 0 0 1px rgba(249, 168, 37, 0.25), 0 0 6px rgba(249, 168, 37, 0.35)',
+            animation: 'tk-affine-hint-pulse 1.6s ease-in-out infinite',
+          }}>
+            <div style={{ fontWeight: 700, letterSpacing: 0.4 }}>
+              АФФИННЫЙ РЕЖИМ
+            </div>
+            <div style={{ opacity: 0.85, marginTop: 1 }}>
+              потяните за угол → перспектива
+            </div>
           </div>
         )}
         <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>

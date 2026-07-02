@@ -56,9 +56,8 @@ import {
   BlendMode,
   ScreentoneParams,
   DEFAULT_PARAMS,
-  DEFAULT_TRANSFORM,
-  blendToCompositeOp,
   getLayerNaturalSize,
+  Vec2,
 } from './types';
 import { renderScreentone } from './engine';
 import { CompositeContext } from './composite';
@@ -166,7 +165,9 @@ function renderLayerToNaturalCanvas(
 
   let renderW = naturalSize.w;
   let renderH = naturalSize.h;
-  if (layer.type === 'solid') {
+  // v2.9: text/vector layers also get docSize override.
+  if (layer.type === 'solid' || layer.type === 'transparent'
+      || layer.type === 'text' || layer.type === 'vector') {
     renderW = compositeCtx.docWidth;
     renderH = compositeCtx.docHeight;
   }
@@ -194,6 +195,26 @@ function renderLayerToNaturalCanvas(
       if (!layer.solidColor) return null;
       ctx.fillStyle = layer.solidColor;
       ctx.fillRect(0, 0, renderW, renderH);
+      break;
+    }
+    case 'transparent': {
+      // No content to render — the canvas is already cleared to transparent.
+      // We still export an (empty) PNG so other ORA readers see a layer
+      // entry; the gentonik:type="transparent" attribute signals that
+      // the layer has no fill, and the mask (if any) is restored separately.
+      break;
+    }
+    case 'text': {
+      // v2.9 STUB: Text layers are not rendered by the core. We export an
+      // empty PNG (so the layer entry exists in stack.xml) and serialize
+      // the textData via gentonik:text-data attribute. A future TextRenderer
+      // (or WebToonTools) will handle actual rendering on import.
+      break;
+    }
+    case 'vector': {
+      // v2.9 STUB: Vector layers are not rendered by the core. We export an
+      // empty PNG and serialize the vectorData via gentonik:vector-data
+      // attribute. A future VectorRenderer will handle rendering on import.
       break;
     }
   }
@@ -320,7 +341,9 @@ function computeLayerXY(
 
   let renderW = naturalSize.w;
   let renderH = naturalSize.h;
-  if (layer.type === 'solid') {
+  // v2.9: text/vector layers also get docSize override.
+  if (layer.type === 'solid' || layer.type === 'transparent'
+      || layer.type === 'text' || layer.type === 'vector') {
     renderW = compositeCtx.docWidth;
     renderH = compositeCtx.docHeight;
   }
@@ -357,13 +380,24 @@ function encodeMaskAttr(
     });
   } else {
     // painted — store reference to the PNG, plus metadata
-    return JSON.stringify({
+    const result: Record<string, unknown> = {
       type: 'painted',
       src: maskSrc, // e.g. "data/layer3-mask.png"
       width: mask.width,
       height: mask.height,
+      // A2-fix-mask-transform (2026-06-25): mask anchor in layer-local space.
+      // Older .ora files (pre-fix) won't have these — import defaults to 0
+      // (mask editor always paints at 0,0; selection tools always set them).
+      offsetX: mask.offsetX,
+      offsetY: mask.offsetY,
       invert: mask.invert,
-    });
+    };
+    // PRESERVE-PERSPECTIVE: canvas-space mask polygon (for "by canvas shape" mode).
+    // Stored as part of the mask JSON so it round-trips through .ora save/load.
+    if (mask.canvasSpacePolygon) {
+      result.canvasSpacePolygon = mask.canvasSpacePolygon;
+    }
+    return JSON.stringify(result);
   }
 }
 
@@ -404,6 +438,28 @@ function buildLayerElement(
     `gentonik:updated-at="${layer.updatedAt}"`,
   ];
 
+  // A3: Serialize perspective corners (if set).
+  if (layer.transform.corners) {
+    const c = layer.transform.corners;
+    gentonikAttrs.push(
+      `gentonik:corner-tl-x="${c[0].x.toFixed(2)}"`,
+      `gentonik:corner-tl-y="${c[0].y.toFixed(2)}"`,
+      `gentonik:corner-tr-x="${c[1].x.toFixed(2)}"`,
+      `gentonik:corner-tr-y="${c[1].y.toFixed(2)}"`,
+      `gentonik:corner-br-x="${c[2].x.toFixed(2)}"`,
+      `gentonik:corner-br-y="${c[2].y.toFixed(2)}"`,
+      `gentonik:corner-bl-x="${c[3].x.toFixed(2)}"`,
+      `gentonik:corner-bl-y="${c[3].y.toFixed(2)}"`,
+    );
+  }
+
+  if (layer.naturalWidth !== undefined) {
+    gentonikAttrs.push(`gentonik:natural-width="${layer.naturalWidth}"`);
+  }
+  if (layer.naturalHeight !== undefined) {
+    gentonikAttrs.push(`gentonik:natural-height="${layer.naturalHeight}"`);
+  }
+
   // Type-specific payload
   if (layer.type === 'solid' && layer.solidColor) {
     gentonikAttrs.push(`gentonik:solid-color="${xmlEscape(layer.solidColor)}"`);
@@ -421,6 +477,26 @@ function buildLayerElement(
     // For image layers, the imageSrc is a data: URL stored inline.
     // It's already base64 in that case, so we just reference it.
     gentonikAttrs.push(`gentonik:image-src-b64="${btoa(unescape(encodeURIComponent(layer.imageSrc)))}"`);
+  }
+  // v2.9: Text / Vector layer payload serialization (STUB).
+  // We serialize the full textData / vectorData as base64 JSON so the .ora
+  // round-trips perfectly. On import, the data is restored; the core just
+  // doesn't render it (a future plugin will).
+  if (layer.type === 'text' && layer.textData) {
+    const json = JSON.stringify(layer.textData);
+    gentonikAttrs.push(`gentonik:text-data-b64="${btoa(unescape(encodeURIComponent(json)))}"`);
+  }
+  if (layer.type === 'vector' && layer.vectorData) {
+    const json = JSON.stringify(layer.vectorData);
+    gentonikAttrs.push(`gentonik:vector-data-b64="${btoa(unescape(encodeURIComponent(json)))}"`);
+  }
+  // v2.9: colorSpace (per-layer) + meta (plugin metadata bag).
+  if (layer.colorSpace && layer.colorSpace !== 'srgb') {
+    gentonikAttrs.push(`gentonik:color-space="${xmlEscape(layer.colorSpace)}"`);
+  }
+  if (layer.meta && Object.keys(layer.meta).length > 0) {
+    const json = JSON.stringify(layer.meta);
+    gentonikAttrs.push(`gentonik:meta-b64="${btoa(unescape(encodeURIComponent(json)))}"`);
   }
 
   // Mask
@@ -650,7 +726,14 @@ interface ParsedLayerEntry {
   gentonikSolidColor?: string;
   gentonikParamsB64?: string;
   gentonikImageSrcB64?: string;
+  gentonikTextDataB64?: string;       // v2.9: text layer payload
+  gentonikVectorDataB64?: string;     // v2.9: vector layer payload
+  gentonikColorSpace?: string;        // v2.9: per-layer color space
+  gentonikMetaB64?: string;           // v2.9: plugin metadata bag
   gentonikMask?: string;
+  gentonikNaturalWidth?: number;
+  gentonikNaturalHeight?: number;
+  gentonikCorners?: [Vec2, Vec2, Vec2, Vec2];
 }
 
 function parseStackXml(xml: string): { width: number; height: number; layers: ParsedLayerEntry[] } {
@@ -716,8 +799,43 @@ function parseStackXml(xml: string): { width: number; height: number; layers: Pa
     if (gPb) entry.gentonikParamsB64 = gPb;
     const gIs = getAttr('gentonik:image-src-b64');
     if (gIs) entry.gentonikImageSrcB64 = gIs;
+    // v2.9: text / vector / colorSpace / meta
+    const gTd = getAttr('gentonik:text-data-b64');
+    if (gTd) entry.gentonikTextDataB64 = gTd;
+    const gVd = getAttr('gentonik:vector-data-b64');
+    if (gVd) entry.gentonikVectorDataB64 = gVd;
+    const gCs = getAttr('gentonik:color-space');
+    if (gCs) entry.gentonikColorSpace = gCs;
+    const gMeta = getAttr('gentonik:meta-b64');
+    if (gMeta) entry.gentonikMetaB64 = gMeta;
     const gM = getAttr('gentonik:mask');
     if (gM) entry.gentonikMask = gM;
+    const gNw = getAttr('gentonik:natural-width');
+    if (gNw !== undefined) entry.gentonikNaturalWidth = parseFloat(gNw);
+    const gNh = getAttr('gentonik:natural-height');
+    if (gNh !== undefined) entry.gentonikNaturalHeight = parseFloat(gNh);
+
+    const gCTlx = getAttr('gentonik:corner-tl-x');
+    const gCTly = getAttr('gentonik:corner-tl-y');
+    const gCTrx = getAttr('gentonik:corner-tr-x');
+    const gCTry = getAttr('gentonik:corner-tr-y');
+    const gCBrx = getAttr('gentonik:corner-br-x');
+    const gCBry = getAttr('gentonik:corner-br-y');
+    const gCBlx = getAttr('gentonik:corner-bl-x');
+    const gCBly = getAttr('gentonik:corner-bl-y');
+    if (
+      gCTlx !== undefined && gCTly !== undefined &&
+      gCTrx !== undefined && gCTry !== undefined &&
+      gCBrx !== undefined && gCBry !== undefined &&
+      gCBlx !== undefined && gCBly !== undefined
+    ) {
+      entry.gentonikCorners = [
+        { x: parseFloat(gCTlx), y: parseFloat(gCTly) },
+        { x: parseFloat(gCTrx), y: parseFloat(gCTry) },
+        { x: parseFloat(gCBrx), y: parseFloat(gCBry) },
+        { x: parseFloat(gCBlx), y: parseFloat(gCBly) },
+      ];
+    }
 
     return entry;
   });
@@ -738,7 +856,7 @@ function b64ToUtf8(b64: string): string {
  *
  * What's preserved on round-trip (GenToniK → ORA → GenToniK):
  *   • Layer order, names, visibility, opacity, blend mode
- *   • Layer type (screentone/image/solid)
+ *   • Layer type (screentone/image/solid/transparent)
  *   • Full ScreentoneParams (via gentonik:params-b64)
  *   • Full LayerTransform (via gentonik:transform-* / scale-* / rotation)
  *   • Layer masks (shape or painted, via gentonik:mask + data/layerN-mask.png)
@@ -834,6 +952,7 @@ export async function importOra(blob: Blob): Promise<OraImportResult> {
       rotation: entry.gentonikRotation ?? 0,
       skewX: entry.gentonikSkewX ?? 0,
       skewY: entry.gentonikSkewY ?? 0,
+      corners: entry.gentonikCorners ?? null,
     };
 
     // Determine layer type. If gentonik:type is set, use it.
@@ -841,6 +960,9 @@ export async function importOra(blob: Blob): Promise<OraImportResult> {
     let layerType: Layer['type'] = 'image';
     if (entry.gentonikType === 'screentone') layerType = 'screentone';
     else if (entry.gentonikType === 'solid') layerType = 'solid';
+    else if (entry.gentonikType === 'transparent') layerType = 'transparent';
+    else if (entry.gentonikType === 'text') layerType = 'text';
+    else if (entry.gentonikType === 'vector') layerType = 'vector';
     else if (entry.gentonikType === 'image') layerType = 'image';
     else downgradedLayers++;
 
@@ -882,8 +1004,17 @@ export async function importOra(blob: Blob): Promise<OraImportResult> {
               width: maskImageData.width,
               height: maskImageData.height,
               data: alphaData,
+              // A2-fix-mask-transform (2026-06-25): restore layer-local anchor.
+              // Older .ora files (pre-fix) lack these fields → default to 0,
+              // which is correct for mask-editor-painted full-size masks.
+              offsetX: typeof maskSpec.offsetX === 'number' ? maskSpec.offsetX : 0,
+              offsetY: typeof maskSpec.offsetY === 'number' ? maskSpec.offsetY : 0,
               invert: false, // already baked into the PNG at export
             };
+            // PRESERVE-PERSPECTIVE: restore canvas-space mask polygon if present.
+            if (Array.isArray(maskSpec.canvasSpacePolygon) && maskSpec.canvasSpacePolygon.length >= 3) {
+              mask.canvasSpacePolygon = maskSpec.canvasSpacePolygon.map((p: { x: number; y: number }) => ({ x: p.x, y: p.y }));
+            }
           }
         }
       } catch (err) {
@@ -905,6 +1036,13 @@ export async function importOra(blob: Blob): Promise<OraImportResult> {
       updatedAt: entry.gentonikUpdatedAt ?? now,
     };
 
+    if (entry.gentonikNaturalWidth !== undefined) {
+      layer.naturalWidth = entry.gentonikNaturalWidth;
+    }
+    if (entry.gentonikNaturalHeight !== undefined) {
+      layer.naturalHeight = entry.gentonikNaturalHeight;
+    }
+
     // Type-specific payload
     if (layerType === 'screentone' && entry.gentonikParamsB64) {
       try {
@@ -921,6 +1059,28 @@ export async function importOra(blob: Blob): Promise<OraImportResult> {
       }
     } else if (layerType === 'solid' && entry.gentonikSolidColor) {
       layer.solidColor = entry.gentonikSolidColor;
+    } else if (layerType === 'transparent') {
+      // No payload to restore — transparent layers have no fill or image.
+      // The mask (if any) was already decoded above and assigned to `mask`,
+      // which gets attached to the layer below.
+    } else if (layerType === 'text') {
+      // v2.9: Restore text layer data from base64 JSON.
+      if (entry.gentonikTextDataB64) {
+        try {
+          layer.textData = JSON.parse(b64ToUtf8(entry.gentonikTextDataB64));
+        } catch (err) {
+          warnings.push(`Layer "${entry.name}": failed to decode text-data: ${(err as Error).message}`);
+        }
+      }
+    } else if (layerType === 'vector') {
+      // v2.9: Restore vector layer data from base64 JSON.
+      if (entry.gentonikVectorDataB64) {
+        try {
+          layer.vectorData = JSON.parse(b64ToUtf8(entry.gentonikVectorDataB64));
+        } catch (err) {
+          warnings.push(`Layer "${entry.name}": failed to decode vector-data: ${(err as Error).message}`);
+        }
+      }
     } else if (layerType === 'image') {
       // For image layers, prefer the gentonik:image-src-b64 if present
       // (it preserves the original data URL), otherwise use the
@@ -939,6 +1099,18 @@ export async function importOra(blob: Blob): Promise<OraImportResult> {
       layer.type = 'image';
       layer.imageSrc = dataUrl;
       downgradedLayers++;
+    }
+
+    // v2.9: Restore per-layer colorSpace and plugin metadata (meta).
+    if (entry.gentonikColorSpace) {
+      layer.colorSpace = entry.gentonikColorSpace as Layer['colorSpace'];
+    }
+    if (entry.gentonikMetaB64) {
+      try {
+        layer.meta = JSON.parse(b64ToUtf8(entry.gentonikMetaB64));
+      } catch {
+        // Ignore malformed meta — it's optional.
+      }
     }
 
     layers.push(layer);

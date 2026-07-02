@@ -64,7 +64,9 @@ export type DebugCategory =
   | 'bridge'
   | 'engine'
   | 'ui'
-  | 'system';
+  | 'system'
+  | 'bake'   // v2.9.1: Bake Transform
+  | 'doc';   // v2.9.1: Document-level operations (color profile conversion etc.)
 
 export type DebugLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace';
 
@@ -518,7 +520,7 @@ export function DebugPanel({
   onClose,
   initialLevel = 'info',
   initialCategory,
-}: DebugPanelProps): JSX.Element | null {
+}: DebugPanelProps) {
   const [internalOpen, setInternalOpen] = useState(false);
   const [levelFilter, setLevelFilter] = useState<DebugLevel>(initialLevel);
   const [categoryFilter, setCategoryFilter] = useState<DebugCategory | ''>(
@@ -787,7 +789,7 @@ function DebugEntryRow({
   showThumbnail,
   isSelected,
   onSelect,
-}: DebugEntryRowProps): JSX.Element {
+}: DebugEntryRowProps) {
   const levelColor = LEVEL_COLORS[entry.level] ?? '#ccc';
   const categoryColor = CATEGORY_COLORS[entry.category] ?? '#888';
 
@@ -928,6 +930,8 @@ const CATEGORY_COLORS: Record<DebugCategory, string> = {
   engine: '#ff8c00',
   ui: '#b0b0b0',
   system: '#666',
+  bake: '#ff6347',    // v2.9.1
+  doc: '#4682b4',     // v2.9.1
 };
 
 // ────────────────────────────────────────────────────────────
