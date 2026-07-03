@@ -1698,6 +1698,14 @@ interface CanvasViewProps {
   activeTool: ToolId;
   /** v2.10: Bucket fill callback — called on click when activeTool === 'bucket'. */
   onBucketFill?: () => void;
+  /** v2.14: Measure tool callbacks. */
+  onMeasureStart?: (docX: number, docY: number) => void;
+  onMeasureMove?: (docX: number, docY: number) => void;
+  onMeasureEnd?: () => void;
+  /** v2.14: Current measure line for overlay rendering. */
+  measureLine?: { start: { x: number; y: number }; end: { x: number; y: number } } | null;
+  /** v2.14: DPI for measure label conversion. */
+  dpi?: number;
 }
 
 /** v2.5: Zoom tool zoom factor per click. */
@@ -1707,7 +1715,7 @@ const ZOOM_DRAG_THRESHOLD = 5;
 
 function CanvasView({
   canvasRef, docSize, zoom, panX, panY, onZoom, onPan, selectedLayer, compositeCtx,
-  activeTool, onBucketFill,
+  activeTool, onBucketFill, onMeasureStart, onMeasureMove, onMeasureEnd, measureLine, dpi,
 }: CanvasViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ startX: number; startY: number; panX: number; panY: number } | null>(null);
@@ -1793,6 +1801,17 @@ function CanvasView({
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
+    // v2.14: Measure tool — start drag to measure distance/angle
+    if (activeTool === 'measure' && e.button === 0) {
+      e.preventDefault();
+      const container = containerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const docX = (e.clientX - rect.left - panX) / zoom;
+      const docY = (e.clientY - rect.top - panY) / zoom;
+      onMeasureStart?.(docX, docY);
+      return;
+    }
     // v2.10: Bucket tool — click fills canvas/selection/layer.
     // No drag, no marquee — just a single click triggers the fill.
     if (activeTool === 'bucket' && e.button === 0) {
@@ -1826,6 +1845,16 @@ function CanvasView({
       onPan(dragRef.current.panX + dx, dragRef.current.panY + dy);
       return;
     }
+    // v2.14: Measure tool — update end point during drag
+    if (activeTool === 'measure' && onMeasureMove) {
+      const container = containerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const docX = (e.clientX - rect.left - panX) / zoom;
+      const docY = (e.clientY - rect.top - panY) / zoom;
+      onMeasureMove(docX, docY);
+      return;
+    }
     // v2.5: Zoom tool marquee drag — update live marquee rect.
     if (zoomMarqueeRef.current) {
       const container = containerRef.current;
@@ -1848,6 +1877,10 @@ function CanvasView({
   };
 
   const handleMouseUp = (e: React.MouseEvent) => {
+    if (activeTool === 'measure' && onMeasureEnd) {
+      onMeasureEnd();
+      return;
+    }
     if (dragRef.current) {
       dragRef.current = null;
       return;
@@ -1914,7 +1947,9 @@ function CanvasView({
     ? (zoomMarqueeRef.current?.altKey ? 'zoom-out' : 'zoom-in')
     : activeTool === 'bucket'
       ? 'crosshair'
-      : (dragRef.current ? 'grabbing' : 'default');
+      : activeTool === 'measure'
+        ? 'crosshair'
+        : (dragRef.current ? 'grabbing' : 'default');
 
   return (
     <div
@@ -2016,6 +2051,69 @@ function CanvasView({
       )}
 
       {/* Zoom badge removed — zoom/dims/DPI now live in the bottom Status Bar */}
+
+      {/* v2.14: Measure tool overlay — line + distance/angle label */}
+      {activeTool === 'measure' && measureLine && (
+        <MeasureOverlay line={measureLine} panX={panX} panY={panY} zoom={zoom} dpi={dpi} />
+      )}
+    </div>
+  );
+}
+
+// v2.14: Measure overlay component
+function MeasureOverlay({ line, panX, panY, zoom, dpi = 300 }: {
+  line: { start: { x: number; y: number }; end: { x: number; y: number } };
+  panX: number; panY: number; zoom: number; dpi?: number;
+}) {
+  const sx = panX + line.start.x * zoom;
+  const sy = panY + line.start.y * zoom;
+  const ex = panX + line.end.x * zoom;
+  const ey = panY + line.end.y * zoom;
+  const dx = line.end.x - line.start.x;
+  const dy = line.end.y - line.start.y;
+  const distPx = Math.sqrt(dx * dx + dy * dy);
+  const distMm = (distPx * 25.4) / dpi;
+  const angleRad = Math.atan2(dy, dx);
+  const angleDeg = (angleRad * 180) / Math.PI;
+
+  // Label position: midpoint of the line, offset above
+  const midX = (sx + ex) / 2;
+  const midY = (sy + ey) / 2;
+
+  const label = `${distPx.toFixed(1)}px (${distMm.toFixed(1)}mm) · ${angleDeg.toFixed(1)}°`;
+
+  return (
+    <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 100 }}>
+      <svg width="100%" height="100%" style={{ position: 'absolute', inset: 0 }}>
+        {/* Main line */}
+        <line x1={sx} y1={sy} x2={ex} y2={ey} stroke="#00aaff" strokeWidth={2} />
+        {/* Endpoints */}
+        <circle cx={sx} cy={sy} r={4} fill="#00aaff" />
+        <circle cx={ex} cy={ey} r={4} fill="#00aaff" />
+        {/* Perpendicular tick at midpoint for angle reference */}
+        {distPx > 10 && (
+          <line
+            x1={midX - dy * 0.05} y1={midY + dx * 0.05}
+            x2={midX + dy * 0.05} y2={midY - dx * 0.05}
+            stroke="#00aaff" strokeWidth={1} opacity={0.5}
+          />
+        )}
+      </svg>
+      {/* Label */}
+      <div style={{
+        position: 'absolute',
+        left: midX + 8, top: midY - 20,
+        background: 'rgba(0, 170, 255, 0.9)',
+        color: '#fff',
+        fontSize: 11,
+        fontWeight: 600,
+        padding: '2px 6px',
+        borderRadius: 3,
+        whiteSpace: 'nowrap',
+        fontFamily: 'ui-monospace, Menlo, monospace',
+      }}>
+        {label}
+      </div>
     </div>
   );
 }
@@ -2245,7 +2343,8 @@ const TOOLBOX_GROUPS: ToolGroup[] = [
     label: 'Navigate',
     tools: [
       { id: 'none', icon: '▷', label: 'Cursor', hint: 'Cursor (no tool) — pan/zoom only' },
-      { id: 'zoom', icon: '🔍', label: 'Zoom', hint: 'Zoom tool (Z) — click=zoom in, Alt+click=zoom out, drag=marquee' },
+      { id: 'zoom', icon: '🔍', label: 'Zoom', hint: 'Zoom tool — click=zoom in, Alt+click=zoom out, drag=marquee' },
+      { id: 'measure', icon: '📐', label: 'Measure', hint: 'Measure (U) — drag to measure distance and angle' },
     ],
   },
   {
@@ -2364,10 +2463,11 @@ const TOOL_LABELS: Record<ToolId, string> = {
   polygonal: 'Polygonal Lasso',
   zoom: 'Zoom',
   bucket: 'Bucket Fill',
+  measure: 'Measure',
 };
 
 const TOOL_HINTS: Record<ToolId, string> = {
-  none: 'Space-drag to pan · ⌘/Ctrl+wheel to zoom',
+  none: 'Space-drag to pan · Ctrl+scroll to zoom',
   move: 'Drag to move · Shift+edge-handle to skew · V',
   scale: 'Drag corner to scale · Shift+edge-handle to skew · S',
   rotate: 'Drag to rotate (Shift = 45° snap) · Shift+edge-handle to skew · R',
@@ -2377,8 +2477,9 @@ const TOOL_HINTS: Record<ToolId, string> = {
   ellipse: 'Click-drag to mark elliptical selection · E',
   lasso: 'Draw freehand · release to close selection · L',
   polygonal: 'Click to add points · double-click to close · P',
-  zoom: 'Click to zoom in · Alt+click to zoom out · drag to marquee-zoom · Z',
+  zoom: 'Click to zoom in · Alt+click to zoom out · drag to marquee-zoom',
   bucket: 'Click to fill canvas or selection · B — choose mode in panel below',
+  measure: 'Drag to measure distance and angle · U — also shows angle for layer alignment',
 };
 
 function StatusBar({
@@ -3015,7 +3116,8 @@ interface PopupPaletteProps {
 
 const PALETTE_TOOLS: Array<{ id: ToolId; icon: string; label: string; key: string }> = [
   { id: 'none',        icon: '▷', label: 'Cursor',  key: 'C' },
-  { id: 'zoom',        icon: '🔍', label: 'Zoom',    key: 'Z' },
+  { id: 'zoom',        icon: '🔍', label: 'Zoom',    key: '' },
+  { id: 'measure',     icon: '📐', label: 'Measure', key: 'U' },
   { id: 'bucket',      icon: '🪣', label: 'Bucket',  key: 'B' },
   { id: 'move',        icon: '✥', label: 'Move',    key: 'V' },
   { id: 'scale',       icon: '⤢', label: 'Scale',   key: 'S' },
@@ -3796,6 +3898,8 @@ export default function App() {
   //   'screentone-selection' — fill active selection with screentone (new layer)
   const [bucketMode, setBucketMode] = useState<BucketMode>('solid-canvas');
   const [bucketColor, setBucketColor] = useState('#000000');
+  // v2.14: Measure tool state — {start, end} in doc-px, null = no measurement
+  const [measureLine, setMeasureLine] = useState<{ start: { x: number; y: number }; end: { x: number; y: number } } | null>(null);
 
   // ── NEW (v2.3): Right-click popup palette (Krita-style) ──
   // Null = hidden; otherwise {x, y} = clientX/clientY where it appeared.
@@ -4411,6 +4515,7 @@ export default function App() {
       const TOOL_CODES: Record<string, ToolId> = {
         KeyV: 'move', KeyS: 'scale', KeyR: 'rotate', KeyK: 'skew', KeyF: 'perspective',
         KeyE: 'ellipse', KeyL: 'lasso', KeyP: 'polygonal', KeyC: 'none', KeyB: 'bucket',
+        KeyU: 'measure',
       };
       const tool = TOOL_CODES[code];
       if (tool) {
@@ -5395,6 +5500,8 @@ export default function App() {
   // visual-only (so the user can see the deformed shape).
   const handleToolChange = useCallback((newTool: ToolId) => {
     setActiveTool(newTool);
+    // v2.14: Clear measure line when switching away from measure tool
+    if (newTool !== 'measure') setMeasureLine(null);
   }, []);
 
   const handleSavePreset = useCallback(() => {
@@ -5981,6 +6088,11 @@ export default function App() {
                 compositeCtx={compositeCtx}
                 activeTool={activeTool}
                 onBucketFill={handleBucketFill}
+                onMeasureStart={(docX, docY) => setMeasureLine({ start: { x: docX, y: docY }, end: { x: docX, y: docY } })}
+                onMeasureMove={(docX, docY) => setMeasureLine(prev => prev ? { ...prev, end: { x: docX, y: docY } } : null)}
+                onMeasureEnd={() => { /* keep line visible after drag ends */ }}
+                measureLine={measureLine}
+                dpi={dpi}
               />
               {selectedLayer && (
                 <TransformOverlayCanvas

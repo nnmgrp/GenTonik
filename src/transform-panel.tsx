@@ -75,7 +75,7 @@ export type SelectionToolId =
   | 'lasso'
   | 'polygonal';
 
-export type ToolId = TransformToolId | SelectionToolId | 'zoom' | 'bucket' | 'none';
+export type ToolId = TransformToolId | SelectionToolId | 'zoom' | 'bucket' | 'measure' | 'none';
 
 export interface ToolState {
   tool: ToolId;

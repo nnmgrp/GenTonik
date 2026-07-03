@@ -124,8 +124,9 @@ export type ToolId =
   | 'ellipse'
   | 'lasso'
   | 'polygonal'
-  | 'zoom'    // v2.5: Photoshop-style Zoom tool (click=zoom in, Alt+click=zoom out, drag=marquee zoom)
-  | 'bucket'  // v2.10: Bucket fill tool (solid/screentone, canvas/selection/into-layer)
+  | 'zoom'    // v2.5: Photoshop-style Zoom tool
+  | 'bucket'  // v2.10: Bucket fill tool
+  | 'measure' // v2.14: Measure tool (distance + angle)
   | 'none';
 
 // ────────────────────────────────────────────────────────────
@@ -566,7 +567,7 @@ export const TransformOverlayCanvas: React.FC<TransformOverlayCanvasProps> = ({
       // We achieve this by NOT early-returning for bucket; instead, we
       // skip only the handle-drawing section (step 5) below via a
       // tool === 'bucket' check. Selection drawing (step 7a/7) runs.
-      if (tool === 'zoom') {
+      if (tool === 'zoom' || tool === 'measure') {
         rafRef.current = requestAnimationFrame(render);
         return;
       }
@@ -1560,7 +1561,7 @@ export const TransformOverlayCanvas: React.FC<TransformOverlayCanvasProps> = ({
           // CanvasView below, which owns the Zoom tool's click/drag handling.
           // Previously the overlay canvas always had pointerEvents:'auto', which
           // intercepted every click and the Zoom tool appeared dead.
-          pointerEvents: (tool === 'zoom' || tool === 'none' || tool === 'bucket') ? 'none' : 'auto',
+          pointerEvents: (tool === 'zoom' || tool === 'none' || tool === 'bucket' || tool === 'measure') ? 'none' : 'auto',
           cursor,
           // touch-action: none — обязательно для pointer events на touch-устройствах
           touchAction: 'none',
