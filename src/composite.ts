@@ -50,6 +50,7 @@ import { renderScreentone } from './engine';
 import {
   computeHomography,
   applyHomography,
+  invertHomography,
   affineFromTriangle,
   pointInQuad,
   isQuadDegenerate,
@@ -107,6 +108,8 @@ export interface CompositeContext {
    * is happening — e.g., initial load, undo/redo, layer ops).
    */
   perspectiveSubdivisions?: number;
+  /** v2.13: High quality rendering flag (for Bake/Export) using backward mapping. */
+  highQuality?: boolean;
 }
 
 // ────────────────────────────────────────────────────────────
@@ -708,6 +711,158 @@ function drawTriangleAffine(
   destCtx.restore();
 }
 
+// ────────────────────────────────────────────────────────────
+// v2.13: High-quality backward mapping for perspective rendering
+// (Patch by Gemini & KIMI — eliminates triangular waves/moire)
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Scanline clipping: for a given Y, find left/right intersections with quad edges.
+ * Returns [startX, endX] in document space, or null if no intersection.
+ */
+function getQuadScanline(
+  quad: readonly [Vec2, Vec2, Vec2, Vec2],
+  y: number,
+  minX: number,
+  maxX: number
+): [number, number] | null {
+  const intersections: number[] = [];
+  for (let i = 0; i < 4; i++) {
+    const p1 = quad[i];
+    const p2 = quad[(i + 1) % 4];
+    if ((p1.y < y && p2.y >= y) || (p2.y < y && p1.y >= y)) {
+      if (Math.abs(p2.y - p1.y) < 1e-6) continue;
+      const t = (y - p1.y) / (p2.y - p1.y);
+      const x = p1.x + t * (p2.x - p1.x);
+      intersections.push(x);
+    }
+  }
+  if (intersections.length < 2) return null;
+  intersections.sort((a, b) => a - b);
+  const left = Math.max(minX, Math.floor(intersections[0]));
+  const right = Math.min(maxX, Math.ceil(intersections[intersections.length - 1]));
+  if (left >= right) return null;
+  return [left, right];
+}
+
+/**
+ * High-quality perspective mapping using backward (inverse) homography
+ * with bilinear filtering and scanline clipping.
+ * Uses a temporary offscreen canvas to preserve globalAlpha/globalCompositeOperation.
+ */
+export function drawImageWithPerspectiveBackward(
+  destCtx: CanvasRenderingContext2D,
+  srcCanvas: HTMLCanvasElement,
+  srcW: number,
+  srcH: number,
+  dstCorners: readonly [Vec2, Vec2, Vec2, Vec2],
+): void {
+  if (srcW <= 0 || srcH <= 0) return;
+  if (isQuadDegenerate(dstCorners)) return;
+
+  const srcQuad: [Vec2, Vec2, Vec2, Vec2] = [
+    { x: 0, y: 0 },
+    { x: srcW, y: 0 },
+    { x: srcW, y: srcH },
+    { x: 0, y: srcH },
+  ];
+
+  const H = computeHomography(srcQuad, dstCorners);
+  if (!H) {
+    const xs = dstCorners.map(c => c.x);
+    const ys = dstCorners.map(c => c.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    destCtx.drawImage(srcCanvas, minX, minY, maxX - minX, maxY - minY);
+    return;
+  }
+
+  const Hinv = invertHomography(H);
+  if (!Hinv) return;
+
+  const xs = dstCorners.map(c => c.x);
+  const ys = dstCorners.map(c => c.y);
+  const minX = Math.floor(Math.min(...xs));
+  const maxX = Math.ceil(Math.max(...xs));
+  const minY = Math.floor(Math.min(...ys));
+  const maxY = Math.ceil(Math.max(...ys));
+
+  const outW = maxX - minX;
+  const outH = maxY - minY;
+  if (outW <= 0 || outH <= 0) return;
+
+  const srcCtx = srcCanvas.getContext('2d');
+  if (!srcCtx) return;
+  const srcData = srcCtx.getImageData(0, 0, srcW, srcH);
+  const srcPixels = srcData.data;
+
+  const outImage = destCtx.createImageData(outW, outH);
+  const outPixels = outImage.data;
+  outPixels.fill(0);
+
+  const srcStride = srcW * 4;
+
+  for (let y = 0; y < outH; y++) {
+    const dstY = minY + y;
+    const xRange = getQuadScanline(dstCorners, dstY, minX, maxX);
+    if (!xRange) continue;
+
+    const [startX, endX] = xRange;
+    const x0 = Math.max(0, startX - minX);
+    const x1 = Math.min(outW, endX - minX);
+
+    for (let x = x0; x < x1; x++) {
+      const dstX = minX + x;
+      const src = applyHomography(Hinv, { x: dstX, y: dstY });
+      const sx = src.x;
+      const sy = src.y;
+
+      if (sx < 0 || sx >= srcW || sy < 0 || sy >= srcH) continue;
+
+      const outIdx = (y * outW + x) * 4;
+
+      if (sx >= 0 && sx < srcW - 1 && sy >= 0 && sy < srcH - 1) {
+        const x0i = Math.floor(sx);
+        const y0i = Math.floor(sy);
+        const fx = sx - x0i;
+        const fy = sy - y0i;
+
+        const i00 = (y0i * srcW + x0i) * 4;
+        const i10 = i00 + 4;
+        const i01 = i00 + srcStride;
+        const i11 = i01 + 4;
+
+        for (let c = 0; c < 4; c++) {
+          const v00 = srcPixels[i00 + c];
+          const v10 = srcPixels[i10 + c];
+          const v01 = srcPixels[i01 + c];
+          const v11 = srcPixels[i11 + c];
+
+          const v0 = v00 + fx * (v10 - v00);
+          const v1 = v01 + fx * (v11 - v01);
+          outPixels[outIdx + c] = Math.round(v0 + fy * (v1 - v0));
+        }
+      } else {
+        const xi = Math.min(Math.floor(sx), srcW - 1);
+        const yi = Math.min(Math.floor(sy), srcH - 1);
+        const i0 = (yi * srcW + xi) * 4;
+        outPixels[outIdx + 0] = srcPixels[i0 + 0];
+        outPixels[outIdx + 1] = srcPixels[i0 + 1];
+        outPixels[outIdx + 2] = srcPixels[i0 + 2];
+        outPixels[outIdx + 3] = srcPixels[i0 + 3];
+      }
+    }
+  }
+
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = outW;
+  tempCanvas.height = outH;
+  const tempCtx = tempCanvas.getContext('2d');
+  if (!tempCtx) return;
+  tempCtx.putImageData(outImage, 0, 0);
+  destCtx.drawImage(tempCanvas, minX, minY);
+}
+
 function compositeSingleLayer(
   destCtx: CanvasRenderingContext2D,
   layer: Layer,
@@ -794,16 +949,20 @@ function compositeSingleLayer(
 
   // Branch: perspective (corners set) vs affine (default).
   if (layer.transform.corners) {
-    // Perspective path — bypass translate/rotate/scale/skew and
-    // render via homography subdivision.
-    // Gemini 2.3 fix: use adaptive subdivisions from context.
-    // App.tsx sets this to 2 or 4 during live drag for instant
-    // feedback, and 8 or 16 on commit for quality.
-    drawImageWithPerspective(
-      destCtx, offscreen, renderW, renderH,
-      layer.transform.corners,
-      compositeCtx.perspectiveSubdivisions ?? 8,
-    );
+    if (compositeCtx.highQuality) {
+      // v2.13: Backward mapping — eliminates triangular waves/moire
+      drawImageWithPerspectiveBackward(
+        destCtx, offscreen, renderW, renderH,
+        layer.transform.corners
+      );
+    } else {
+      // Perspective path — forward subdivision (fast, for real-time preview).
+      drawImageWithPerspective(
+        destCtx, offscreen, renderW, renderH,
+        layer.transform.corners,
+        compositeCtx.perspectiveSubdivisions ?? 8,
+      );
+    }
   } else {
     // Affine path — translate to the layer's destination center.
     const destCenterX = compositeCtx.docWidth / 2 + layer.transform.x;

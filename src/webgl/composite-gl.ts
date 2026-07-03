@@ -323,19 +323,9 @@ function compositeSingleLayerGL(
     }
   }
 
-  // v2.11.2: Generate mipmaps on the layer FBO texture.
-  // This is critical for reducing moire/waves on screentone dot patterns
-  // when the layer is scaled down or perspective-warped in the composite pass.
-  // LINEAR_MIPMAP_LINEAR (set at FBO creation) uses these mip levels to
-  // pre-filter high-frequency detail, preventing aliasing/moire.
-  // Must be called AFTER all rendering to the FBO is complete (content + mask).
-  // CRITICAL: The FBO must NOT be bound as the current framebuffer when
-  // generateMipmap is called — WebGL spec requires that the texture being
-  // mipmapped is not attached to the currently-bound framebuffer. We unbind
-  // the FBO by binding the default framebuffer (null) first.
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.bindTexture(gl.TEXTURE_2D, layerFBO.tex);
-  gl.generateMipmap(gl.TEXTURE_2D);
+  // v2.12: REMOVED generateMipmap — mipmaps turn crisp manga dots into
+  // gray mush. Moire is addressed via fwidth()+smoothstep() in the
+  // composite fragment shader instead.
 
   // PRESERVE-PERSPECTIVE: rasterize canvas-space clip polygon → texture.
   // The polygon is in canvas-pixel space. We rasterize it to a single-channel

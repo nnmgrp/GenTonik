@@ -439,12 +439,24 @@ float sdfHexagon(vec2 p, float r) {
 }
 
 // Antialiased step: returns 1.0 inside the SDF (negative), 0.0 outside,
-// with a smooth 1px transition at the boundary.
-//   d < 0          → 1.0 (fully inside)
-//   d > 1px        → 0.0 (fully outside)
-//   0 <= d <= 1px  → smoothstep
+// with a smooth transition at the boundary.
+// v2.12: Uses fwidth() for screen-space adaptive AA.
+// When the layer is zoomed out / perspective-warped, the screen pixel
+// covers multiple texture pixels. fwidth(d) measures how fast d changes
+// per screen pixel. We use this to set the smoothstep width = exactly
+// 1 screen pixel, regardless of zoom level. This prevents moire/waves
+// because the edge transition always spans exactly 1 screen pixel.
+//
+// Without fwidth (old code): smoothstep(-0.5, 0.5, d) — fixed 1px in
+// TEXTURE space. When zoomed out 2x, 1 texture px = 0.5 screen px →
+// hard edge → moire. With fwidth: smoothstep(-fw, fw, d) where fw =
+// fwidth(d) = 1 screen px → always smooth, no moire.
 float coverageAA(float d) {
-  return 1.0 - smoothstep(-0.5, 0.5, d);
+  // v2.12.1: Clamp fw to avoid division by zero in smoothstep when d is
+  // constant (inside/outside shapes where fwidth=0). Gemini correctly
+  // identified this as a potential NaN source on some GPU drivers.
+  float fw = max(fwidth(d), 0.0001);
+  return 1.0 - smoothstep(-fw, fw, d);
 }
 
 void main() {

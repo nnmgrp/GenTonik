@@ -57,11 +57,11 @@ import {
   convertLayersColorProfile,
   compositeSingleLayerPublic,
 } from './composite';
-import { renderScreentone } from './engine';
 import { compositeLayersWithFallback } from './webgl';
 import { computeHomography, applyHomography } from './homography';
 import { toPx, fromPx } from './units';
 import * as presetStore from './preset-store';
+import { getInputManager } from './input-manager';
 import {
   saveOraFile, openOraFile, isOraFile, ORA_FILE_ACCEPT,
   type OraImportResult,
@@ -1722,38 +1722,38 @@ function CanvasView({
     return getLayerCanvasBounds(selectedLayer, compositeCtx);
   }, [selectedLayer, compositeCtx]);
 
-  const handleWheel = (e: React.WheelEvent) => {
-    // v2.11: Zoom = Ctrl+scroll (Photoshop convention).
-    // - Ctrl/Cmd+scroll = zoom canvas at any tool. preventDefault stops
-    //   the browser from zooming the entire page UI.
-    // - Plain scroll (no modifier) = zoom ONLY for Cursor ('none') and
-    //   Zoom tools. For all other tools, plain scroll does nothing
-    //   (prevents accidental zoom while using bucket/selection/etc).
-    // - Z+scroll removed (was unreliable, caused side effects with Ctrl+Z).
-    const isCtrlZoom = e.ctrlKey || e.metaKey;
-    if (!isCtrlZoom && activeTool !== 'none' && activeTool !== 'zoom') {
-      return;
-    }
-    e.preventDefault();
+  // v2.12: Native wheel listener with passive:false for reliable preventDefault.
+  // React's onWheel is passive in some browsers → preventDefault is ignored
+  // → browser zooms the entire page instead of just the canvas.
+  // This useEffect attaches a native listener that CAN preventDefault.
+  useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    const rect = container.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
+    const input = getInputManager();
+    const unsub = input.onWheel(container, (e: WheelEvent) => {
+      const isCtrlZoom = e.ctrlKey || e.metaKey;
+      if (!isCtrlZoom && activeTool !== 'none' && activeTool !== 'zoom') {
+        return;
+      }
+      e.preventDefault();
+      const rect = container.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+      const delta = -e.deltaY * 0.001;
+      const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * (1 + delta)));
+      const worldX = (mouseX - panX) / zoom;
+      const worldY = (mouseY - panY) / zoom;
+      onPan(mouseX - worldX * newZoom, mouseY - worldY * newZoom);
+      onZoom(newZoom);
+    });
+    return unsub;
+  }, [activeTool, zoom, panX, panY, onZoom, onPan]);
 
-    // Zoom factor
-    const delta = -e.deltaY * 0.001;
-    const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * (1 + delta)));
-
-    // Zoom toward mouse position: keep the point under cursor stable
-    // World point under cursor before zoom:
-    //   worldX = (mouseX - panX) / zoom
-    // After zoom we want: mouseX = worldX * newZoom + newPanX
-    //   newPanX = mouseX - worldX * newZoom
-    const worldX = (mouseX - panX) / zoom;
-    const worldY = (mouseY - panY) / zoom;
-    onPan(mouseX - worldX * newZoom, mouseY - worldY * newZoom);
-    onZoom(newZoom);
+  const handleWheel = (e: React.WheelEvent) => {
+    // v2.12: React onWheel handler is a no-op now — the native listener
+    // in useEffect above handles everything with passive:false.
+    // This empty handler prevents React from adding its own passive listener
+    // that would conflict.
   };
 
   // v2.5: Helper — zoom by a factor centered on a screen-space point.
@@ -3700,7 +3700,7 @@ function Toolbar({
         type="button"
         onClick={onBakeTransform}
         disabled={!canBake}
-        title="Bake Transform — re-render screentone with scaled spacing, convert to image layer (no re-edit)"
+        title="Rasterize — render screentone with full transform into a fixed image layer (no re-edit)"
         style={{
           ...styles.button,
           padding: '3px 10px',
@@ -3710,7 +3710,7 @@ function Toolbar({
           marginRight: 4,
         }}
       >
-        🔥 Bake
+        🔥 Rasterize
       </button>
 
       <button
@@ -4343,13 +4343,19 @@ export default function App() {
   //   Ctrl/Cmd+R         → toggle rulers
   //   Escape             → close popup palette (if open)
   //   No-modifier single-letter keys → tool hotkeys
-  //     V move · S scale · R rotate · K skew · F perspective
-  //     M rect · E ellipse · L lasso · P polygonal · C cursor
+  //   v2.12: Uses event.code (physical key) not event.key (logical character)
+  //   for layout-independent hotkeys. Ctrl+Z etc. still use event.key for
+  //   backward compat with undo/redo.
   useEffect(() => {
+    const input = getInputManager();
     const handleKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       const mod = e.ctrlKey || e.metaKey;
+      // v2.12.1: Keep BOTH event.code (physical, layout-independent) and
+      // event.key (logical, for Ctrl+Z compatibility). Gemini correctly
+      // identified that removing `k` caused ReferenceError at lines 4399/4421.
+      const code = e.code;
       const k = e.key.toLowerCase();
 
       // Escape closes popup palette or clears active selection
@@ -4369,52 +4375,55 @@ export default function App() {
       }
 
       if (mod) {
-        // Modifier shortcuts — only act on specific keys, ignore others
-        if (k === 'z' && !e.shiftKey) {
+        // v2.12: Modifier shortcuts — use event.key for Ctrl+Z etc.
+        // (event.code 'KeyZ' is the same in all layouts, but event.key 'z'
+        // is also reliable for Ctrl combos since the browser translates it)
+        // v2.12.1: Use BOTH event.key AND event.code for Ctrl+Z (layout-independent).
+        // On Russian layout, Ctrl+Z produces event.key='я' but event.code='KeyZ'.
+        const isZ = (k === 'z' || code === 'KeyZ');
+        if (isZ && !e.shiftKey) {
           e.preventDefault();
           handleUndo();
-        } else if (k === 'z' && e.shiftKey) {
+        } else if (isZ && e.shiftKey) {
           e.preventDefault();
           handleRedo();
-        } else if (k === 'y') {
+        } else if (k === 'y' || code === 'KeyY') {
           e.preventDefault();
           handleRedo();
-        } else if (k === 'r') {
+        } else if (k === 'r' || code === 'KeyR') {
           e.preventDefault();
           setShowRulers(s => !s);
-        } else if (k === '`' || e.key === '`') {
+        } else if (code === 'Backquote') {
           e.preventDefault();
           setDebugOpen(prev => !prev);
         }
         return;
       }
 
-      // 1.5: Mirror Screen toggle (hotkey M)
-      if (k === 'm') {
+      // 1.5: Mirror Screen toggle (hotkey M) — v2.12.1: use event.code
+      if (code === 'KeyM') {
         e.preventDefault();
         setMirrored(prev => !prev);
         return;
       }
-      // No-modifier tool hotkeys (M removed — now used for Mirror)
-      // v2.10.1: Z removed from tool hotkeys — Z is now a modifier for
-      // Z+scroll=zoom (temporary zoom at any tool). To select the Zoom tool,
-      // use the toolbox button or right-click popup palette.
-      const TOOL_KEYS: Record<string, ToolId> = {
-        v: 'move', s: 'scale', r: 'rotate', k: 'skew', f: 'perspective',
-        e: 'ellipse', l: 'lasso', p: 'polygonal', c: 'none', b: 'bucket',
+      // No-modifier tool hotkeys (v2.12: event.code for layout independence)
+      // Z removed — Zoom tool via toolbox/popup only. Ctrl+scroll for zoom.
+      const TOOL_CODES: Record<string, ToolId> = {
+        KeyV: 'move', KeyS: 'scale', KeyR: 'rotate', KeyK: 'skew', KeyF: 'perspective',
+        KeyE: 'ellipse', KeyL: 'lasso', KeyP: 'polygonal', KeyC: 'none', KeyB: 'bucket',
       };
-      const tool = TOOL_KEYS[k];
+      const tool = TOOL_CODES[code];
       if (tool) {
         e.preventDefault();
         handleToolChange(tool);
         return;
       }
 
-      // A2.1a: Selection op mode shortcuts (N key for New mode)
-      const OP_MODE_KEYS: Record<string, SelectionOpMode> = {
-        n: 'new',
+      // A2.1a: Selection op mode shortcuts (N key for New mode) — v2.12.1: event.code
+      const OP_MODE_CODES: Record<string, SelectionOpMode> = {
+        KeyN: 'new',
       };
-      const opMode = OP_MODE_KEYS[k];
+      const opMode = OP_MODE_CODES[code];
       if (opMode) {
         e.preventDefault();
         setSelectionOpMode(opMode);
@@ -4933,22 +4942,17 @@ export default function App() {
     debug.info('preset', `Applied preset: ${preset.name}`);
   }, [selectedLayer, layers, pushHistory]);
 
-  // v2.11.1: Bake Transform — rasterize screentone layer with its FULL transform.
+  // v2.12: Bake Transform — rasterize screentone with FULL transform via SSAA.
   //
-  // Two paths to avoid moire/waves:
+  // Uses the Canvas2D composite pipeline at 4× supersampling, then downscales
+  // with high-quality bicubic smoothing. This produces a clean raster that:
+  //   - Preserves ALL transforms (scale, rotation, skew, perspective)
+  //   - Has NO moire/waves (4× SSAA pre-filters the dot pattern)
+  //   - Keeps crisp dots (not gray mush like mipmaps would produce)
   //
-  // A) Scale-only (no rotation/skew/perspective):
-  //    Render screentone at bakedW×bakedH (= naturalSize × scale) with scaled
-  //    spacing. No interpolation → no moire. This is the old approach that
-  //    worked for scale.
-  //
-  // B) Rotation/skew/perspective:
-  //    Render screentone at SUPER-SAMPLED resolution (2× the baked bounding box)
-  //    with scaled spacing, then apply rotation/skew/perspective via Canvas2D
-  //    transform, then downscale to final size. Supersampling reduces moire.
-  //
-  // In both cases, the result is an image layer with identity transform that
-  // looks exactly like the transformed screentone.
+  // Memory: temp canvases are GC'd after the function returns. For 2000×2000
+  // doc, the SS canvas is 8000×8000 = ~256MB RGBA — large but transient.
+  // A warning is shown for docs > 4000×4000.
   const handleBakeTransform = useCallback(() => {
     if (!selectedLayer || selectedLayer.type !== 'screentone' || !selectedLayer.params) {
       alert('Bake Transform requires a screentone layer.');
@@ -4962,8 +4966,6 @@ export default function App() {
       return;
     }
 
-    const hasRotationOrSkew = t.rotation !== 0 || t.skewX !== 0 || t.skewY !== 0 || !!t.corners;
-
     // Scaled spacing (variant a: dotSize stays, spacing scales)
     const bakedParams = { ...selectedLayer.params };
     if (!t.corners) {
@@ -4971,111 +4973,77 @@ export default function App() {
       bakedParams.spacingY = bakedParams.spacingY * Math.abs(t.scaleY);
     }
 
-    if (!hasRotationOrSkew) {
-      // ── Path A: Scale-only — render at baked size, no interpolation ──
-      const baseW = selectedLayer.naturalWidth ?? docSize.w;
-      const baseH = selectedLayer.naturalHeight ?? docSize.h;
-      const bakedW = Math.max(1, Math.round(baseW * Math.abs(t.scaleX)));
-      const bakedH = Math.max(1, Math.round(baseH * Math.abs(t.scaleY)));
+    // SSAA factor: 4× for best quality, 2× for large docs (>3000px)
+    const SS = (docSize.w > 3000 || docSize.h > 3000) ? 2 : 4;
+    const ssW = docSize.w * SS;
+    const ssH = docSize.h * SS;
 
-      const MAX_BAKE = 8192;
-      if (bakedW > MAX_BAKE || bakedH > MAX_BAKE) {
-        if (!confirm(`Baked size ${bakedW}×${bakedH} is very large. Continue?`)) return;
-      }
-
-      const canvas = document.createElement('canvas');
-      canvas.width = bakedW;
-      canvas.height = bakedH;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) { alert('Failed to get 2D context.'); return; }
-      renderScreentone(ctx, bakedW, bakedH, bakedParams);
-      const dataUrl = canvas.toDataURL('image/png');
-
-      const bakedLayer: Layer = {
-        id: selectedLayer.id,
-        name: selectedLayer.name + ' (baked)',
-        type: 'image',
-        visible: selectedLayer.visible,
-        opacity: selectedLayer.opacity,
-        blendMode: selectedLayer.blendMode,
-        transform: { ...DEFAULT_TRANSFORM, x: t.x, y: t.y },
-        imageSrc: dataUrl,
-        mask: selectedLayer.mask,
-        naturalWidth: bakedW,
-        naturalHeight: bakedH,
-        colorSpace: selectedLayer.colorSpace ?? 'srgb',
-        meta: { ...(selectedLayer.meta ?? {}), bakedFrom: 'screentone', bakedAt: Date.now() },
-        createdAt: selectedLayer.createdAt,
-        updatedAt: Date.now(),
-      };
-      const newLayers = layers.map(l => l.id === selectedLayer.id ? bakedLayer : l);
-      setLayers(newLayers);
-      pushHistory('Bake Transform', { layers: newLayers });
-      debug.info('bake', `Baked (scale-only) ${bakedW}×${bakedH}`);
-      return;
+    if (ssW > 16384 || ssH > 16384) {
+      if (!confirm(`Supersampled size ${ssW}×${ssH} is very large (~${Math.round(ssW * ssH * 4 / 1024 / 1024)}MB). Continue?`)) return;
     }
 
-    // ── Path B: Rotation/skew/perspective — supersampled composite ──
-    //
-    // For perspective (corners): compute the bounding box of the warped quad.
-    // For rotation/skew: compute the bounding box of the rotated/skewed rect.
-    // Then render at 2× that size with scaled spacing, apply the transform,
-    // and downscale to 1× for the final image.
-    //
-    // We use the composite pipeline which already handles all transforms.
-
-    // Create a temp screentone layer with modified params but SAME transform.
-    const tempLayer: Layer = { ...selectedLayer, params: bakedParams };
-
-    // Render at 2× docSize for supersampling (reduces moire from interpolation)
-    const SS = 2; // supersampling factor
-    const renderW = docSize.w * SS;
-    const renderH = docSize.h * SS;
-
-    // Temporarily override docSize in compositeCtx for supersampled render
-    const ssCompositeCtx: CompositeContext = {
-      ...compositeCtx,
-      docWidth: renderW,
-      docHeight: renderH,
-    };
-
-    // Temp layer with supersampled naturalSize
-    const ssLayer: Layer = {
-      ...tempLayer,
-      // Scale transform to match supersampled space
-      transform: {
-        ...t,
-        x: t.x * SS,
-        y: t.y * SS,
-        // For corners, scale them too
-        corners: t.corners
-          ? t.corners.map(c => ({ x: c.x * SS, y: c.y * SS })) as [Vec2, Vec2, Vec2, Vec2]
-          : null,
-      },
-      naturalWidth: tempLayer.naturalWidth ? tempLayer.naturalWidth * SS : undefined,
-      naturalHeight: tempLayer.naturalHeight ? tempLayer.naturalHeight * SS : undefined,
-    };
-
-    const ssCanvas = document.createElement('canvas');
-    ssCanvas.width = renderW;
-    ssCanvas.height = renderH;
-    const ssCtx = ssCanvas.getContext('2d');
-    if (!ssCtx) { alert('Failed to get 2D context.'); return; }
-    ssCtx.clearRect(0, 0, renderW, renderH);
-
-    // Also scale the screentone params for supersampled space
+    // Build a supersampled layer: same transform but in SS× space
+    // v2.12.1: Scale ALL layout params (Gemini correctly identified that
+    // satellites, tileWidth, customWidth etc were missing).
     const ssParams = {
       ...bakedParams,
       spacingX: bakedParams.spacingX * SS,
       spacingY: bakedParams.spacingY * SS,
       dotSize: bakedParams.dotSize * SS,
       lineWidth: bakedParams.lineWidth * SS,
+      satelliteSize: bakedParams.satelliteSize * SS,
+      satelliteDistance: bakedParams.satelliteDistance * SS,
+      tileWidth: (bakedParams.tileWidth || 0) * SS,
+      tileHeight: (bakedParams.tileHeight || 0) * SS,
+      customWidth: (bakedParams.customWidth || 0) * SS,
+      customHeight: (bakedParams.customHeight || 0) * SS,
     };
-    const ssLayerWithParams: Layer = { ...ssLayer, params: ssParams };
+    // v2.12.1: Scale mask for SS space (Gemini correctly identified that
+    // unscaled mask applies at wrong coordinates on the SS canvas).
+    const ssLayer: Layer = {
+      ...selectedLayer,
+      params: ssParams,
+      transform: {
+        ...t,
+        x: t.x * SS,
+        y: t.y * SS,
+        corners: t.corners
+          ? t.corners.map(c => ({ x: c.x * SS, y: c.y * SS })) as [Vec2, Vec2, Vec2, Vec2]
+          : null,
+      },
+      naturalWidth: selectedLayer.naturalWidth ? selectedLayer.naturalWidth * SS : undefined,
+      naturalHeight: selectedLayer.naturalHeight ? selectedLayer.naturalHeight * SS : undefined,
+      // Scale mask: shape bounds × SS, painted mask offsets × SS, canvasSpacePolygon × SS
+      mask: selectedLayer.mask ? (() => {
+        const m = selectedLayer.mask!;
+        if (m.type === 'shape') {
+          return { ...m, bounds: {
+            left: m.bounds.left * SS, top: m.bounds.top * SS,
+            right: m.bounds.right * SS, bottom: m.bounds.bottom * SS,
+          }, feather: m.feather * SS };
+        }
+        return { ...m, offsetX: m.offsetX * SS, offsetY: m.offsetY * SS,
+          canvasSpacePolygon: m.canvasSpacePolygon?.map(p => ({ x: p.x * SS, y: p.y * SS }))
+        };
+      })() : undefined,
+    };
+    const ssCompositeCtx: CompositeContext = {
+      ...compositeCtx,
+      docWidth: ssW,
+      docHeight: ssH,
+      highQuality: true,
+    };
 
-    compositeSingleLayerPublic(ssCtx, ssLayerWithParams, ssCompositeCtx);
+    // Render at SS× resolution
+    const ssCanvas = document.createElement('canvas');
+    ssCanvas.width = ssW;
+    ssCanvas.height = ssH;
+    const ssCtx = ssCanvas.getContext('2d');
+    if (!ssCtx) { alert('Failed to get 2D context.'); return; }
+    ssCtx.clearRect(0, 0, ssW, ssH);
+    compositeSingleLayerPublic(ssCtx, ssLayer, ssCompositeCtx);
 
-    // Downscale to docSize using high-quality image smoothing
+    // Downscale to docSize with bicubic-quality smoothing
     const bakedCanvas = document.createElement('canvas');
     bakedCanvas.width = docSize.w;
     bakedCanvas.height = docSize.h;
@@ -5083,9 +5051,12 @@ export default function App() {
     if (!bakedCtx) { alert('Failed to get 2D context.'); return; }
     bakedCtx.imageSmoothingEnabled = true;
     bakedCtx.imageSmoothingQuality = 'high';
-    bakedCtx.drawImage(ssCanvas, 0, 0, renderW, renderH, 0, 0, docSize.w, docSize.h);
+    bakedCtx.drawImage(ssCanvas, 0, 0, ssW, ssH, 0, 0, docSize.w, docSize.h);
 
     const dataUrl = bakedCanvas.toDataURL('image/png');
+
+    // Free temp canvases (helps GC on large docs)
+    ssCanvas.width = 0; ssCanvas.height = 0;
 
     const bakedLayer: Layer = {
       id: selectedLayer.id,
@@ -5096,7 +5067,9 @@ export default function App() {
       blendMode: selectedLayer.blendMode,
       transform: { ...DEFAULT_TRANSFORM },
       imageSrc: dataUrl,
-      mask: selectedLayer.mask,
+      // v2.12.1: Mask is already baked into the pixels during SSAA render.
+      // Inheriting it would double-apply (Gemini correctly identified this).
+      mask: undefined,
       naturalWidth: docSize.w,
       naturalHeight: docSize.h,
       colorSpace: selectedLayer.colorSpace ?? 'srgb',
@@ -5107,8 +5080,8 @@ export default function App() {
 
     const newLayers = layers.map(l => l.id === selectedLayer.id ? bakedLayer : l);
     setLayers(newLayers);
-    pushHistory('Bake Transform', { layers: newLayers });
-    debug.info('bake', `Baked (supersampled 2×) ${docSize.w}×${docSize.h} with rotation/perspective`);
+    pushHistory('Rasterize', { layers: newLayers });
+    debug.info('bake', `Rasterized SSAA ${SS}× → ${docSize.w}×${docSize.h}`);
   }, [selectedLayer, layers, docSize, compositeCtx, pushHistory, debug]);
 
   // v2.10: Bucket fill — called when user clicks canvas with Bucket tool.
@@ -5594,7 +5567,7 @@ export default function App() {
 
   const handleSaveOra = useCallback(async () => {
     try {
-      await saveOraFile(layers, compositeCtx, `gentonik-${Date.now()}`);
+      await saveOraFile(layers, { ...compositeCtx, highQuality: true }, `gentonik-${Date.now()}`);
       debug.info('ora', `Saved .ora: ${layers.length} layers`);
     } catch (err) {
       debug.error('ora', 'Save failed', err);

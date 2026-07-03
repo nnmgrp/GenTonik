@@ -757,6 +757,7 @@ export function renderCompositeToCanvas(
     docHeight: docSize.height,
     dpi,
     imageCache,
+    highQuality: true,
   };
   compositeLayers(ctx, layers, compositeCtx);
   return canvas;
