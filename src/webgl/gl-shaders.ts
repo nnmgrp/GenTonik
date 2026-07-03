@@ -208,7 +208,12 @@ uniform int       u_needsBlend; // DEPRECATED — kept for ABI compat, ignored.
 // selection outline exactly, regardless of the layer's perspective deformation.
 uniform sampler2D u_canvasClipTex;  // canvas-space clip mask (alpha channel)
 uniform int       u_useCanvasClip;  // 0 = disabled, 1 = enabled
-uniform vec2      u_canvasSize;     // canvas px size (for converting gl_FragCoord → mask UV)
+uniform vec2      u_canvasSize;     // canvas px size (logical; used by COMPOSITE_VERT for perspective clip math)
+// v2.15.2: Physical FBO render size. gl_FragCoord is in FBO-pixel space
+// (0..renderW, 0..renderH), NOT logical canvas space. Using u_canvasSize
+// for canvas-clip UV would produce wrong UVs when renderScale < 1.0
+// (oversized documents). u_canvasSize is still used by COMPOSITE_VERT
+// for perspective homogeneous clip math (that math is dimensionless).
 uniform vec2      u_renderSize;     // physical FBO size (renderW, renderH)
 
 in  vec2 v_uv;
@@ -224,6 +229,12 @@ void main() {
   // gl_FragCoord is in canvas-pixel space (0..canvasW, 0..canvasH), but
   // WebGL Y is bottom-up while the mask was rasterized top-down (Canvas2D
   // convention). We flip Y when computing the mask UV.
+  //
+  // v2.15.2: gl_FragCoord is in FBO-pixel space (0..renderW, 0..renderH),
+  // NOT logical canvas space. We use u_renderSize (physical FBO size) for
+  // the UV denominator so the mask samples correctly even when renderScale
+  // < 1.0 (oversized documents). The mask texture itself was rasterized at
+  // renderW × renderH, so UV must map [0..renderW] → [0..1].
   if (u_useCanvasClip == 1) {
     vec2 maskUV = vec2(
       gl_FragCoord.x / u_renderSize.x,

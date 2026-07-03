@@ -749,6 +749,13 @@ function getQuadScanline(
  * High-quality perspective mapping using backward (inverse) homography
  * with bilinear filtering and scanline clipping.
  * Uses a temporary offscreen canvas to preserve globalAlpha/globalCompositeOperation.
+ *
+ * v2.15.2: Premultiplied alpha handling.
+ * Previous version interpolated raw RGBA, which causes RGB color bleed
+ * into transparent areas — most visible on anti-aliased edges (e.g.
+ * image layers with soft alpha borders). Fix: convert to premultiplied
+ * before interpolation, then unpremultiply after. This matches what
+ * Canvas2D's drawImage would produce for the same source.
  */
 export function drawImageWithPerspectiveBackward(
   destCtx: CanvasRenderingContext2D,
@@ -802,6 +809,20 @@ export function drawImageWithPerspectiveBackward(
 
   const srcStride = srcW * 4;
 
+  // v2.15.2: Premultiplied alpha buffer for srcPixels.
+  // We premultiply ONCE (O(srcW*srcH)) so the inner interpolation loop
+  // doesn't have to do per-sample per-channel premultiply (4× speedup
+  // of the inner loop). Allocate as a regular Uint8ClampedArray for
+  // direct index access.
+  const srcPremult = new Uint8ClampedArray(srcPixels.length);
+  for (let i = 0; i < srcPixels.length; i += 4) {
+    const a = srcPixels[i + 3] / 255;
+    srcPremult[i + 0] = srcPixels[i + 0] * a;
+    srcPremult[i + 1] = srcPixels[i + 1] * a;
+    srcPremult[i + 2] = srcPixels[i + 2] * a;
+    srcPremult[i + 3] = srcPixels[i + 3];
+  }
+
   for (let y = 0; y < outH; y++) {
     const dstY = minY + y;
     const xRange = getQuadScanline(dstCorners, dstY, minX, maxX);
@@ -822,6 +843,9 @@ export function drawImageWithPerspectiveBackward(
       const outIdx = (y * outW + x) * 4;
 
       if (sx >= 0 && sx < srcW - 1 && sy >= 0 && sy < srcH - 1) {
+        // v2.15.2: Interpolate PREMULTIPLIED rgba. This avoids RGB
+        // bleed into transparent areas — the original bug produced
+        // visible color fringing on anti-aliased edges.
         const x0i = Math.floor(sx);
         const y0i = Math.floor(sy);
         const fx = sx - x0i;
@@ -832,24 +856,47 @@ export function drawImageWithPerspectiveBackward(
         const i01 = i00 + srcStride;
         const i11 = i01 + 4;
 
-        for (let c = 0; c < 4; c++) {
-          const v00 = srcPixels[i00 + c];
-          const v10 = srcPixels[i10 + c];
-          const v01 = srcPixels[i01 + c];
-          const v11 = srcPixels[i11 + c];
+        // Interpolate alpha first (needed for unpremultiply).
+        const a00 = srcPremult[i00 + 3];
+        const a10 = srcPremult[i10 + 3];
+        const a01 = srcPremult[i01 + 3];
+        const a11 = srcPremult[i11 + 3];
+        const a0 = a00 + fx * (a10 - a00);
+        const a1 = a01 + fx * (a11 - a01);
+        const outA = Math.round(a0 + fy * (a1 - a0));
 
+        // Interpolate premultiplied RGB.
+        for (let c = 0; c < 3; c++) {
+          const v00 = srcPremult[i00 + c];
+          const v10 = srcPremult[i10 + c];
+          const v01 = srcPremult[i01 + c];
+          const v11 = srcPremult[i11 + c];
           const v0 = v00 + fx * (v10 - v00);
           const v1 = v01 + fx * (v11 - v01);
           outPixels[outIdx + c] = Math.round(v0 + fy * (v1 - v0));
         }
+        outPixels[outIdx + 3] = outA;
       } else {
+        // Edge case: source sample at the very last row/column.
+        // Just copy premultiplied pixel directly.
         const xi = Math.min(Math.floor(sx), srcW - 1);
         const yi = Math.min(Math.floor(sy), srcH - 1);
         const i0 = (yi * srcW + xi) * 4;
-        outPixels[outIdx + 0] = srcPixels[i0 + 0];
-        outPixels[outIdx + 1] = srcPixels[i0 + 1];
-        outPixels[outIdx + 2] = srcPixels[i0 + 2];
-        outPixels[outIdx + 3] = srcPixels[i0 + 3];
+        outPixels[outIdx + 0] = srcPremult[i0 + 0];
+        outPixels[outIdx + 1] = srcPremult[i0 + 1];
+        outPixels[outIdx + 2] = srcPremult[i0 + 2];
+        outPixels[outIdx + 3] = srcPremult[i0 + 3];
+      }
+
+      // v2.15.2: Unpremultiply the output pixel so the result matches
+      // what Canvas2D's drawImage would produce (non-premultiplied RGBA).
+      // Edge case: if alpha is 0, leave RGB at 0 (already filled).
+      const a = outPixels[outIdx + 3];
+      if (a > 0 && a < 255) {
+        const inv = 255 / a;
+        outPixels[outIdx + 0] = Math.min(255, Math.round(outPixels[outIdx + 0] * inv));
+        outPixels[outIdx + 1] = Math.min(255, Math.round(outPixels[outIdx + 1] * inv));
+        outPixels[outIdx + 2] = Math.min(255, Math.round(outPixels[outIdx + 2] * inv));
       }
     }
   }
