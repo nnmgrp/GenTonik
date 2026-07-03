@@ -8,52 +8,6 @@
 //     Returns true on success, false on any failure (caller falls
 //     back to canvas2D compositeLayers).
 //
-// PIPELINE:
-//
-//   1. ensureGLStateSize(state, canvasW, canvasH)
-//      Resize destFBO if the canvas backing store changed.
-//
-//   2. Clear destFBO to transparent.
-//
-//   3. For each visible layer (bottom-to-top):
-//      a. Acquire a layer FBO at the layer's render size
-//         (naturalSize for image/screentone, docSize for solid).
-//      b. Clear layer FBO to transparent.
-//      c. renderLayerContentGL — fill FBO with solid/image/screentone.
-//      d. applyMaskGL — second pass, multiplies alpha by mask.
-//      e. Bind destFBO as render target.
-//      f. Set up composite-quad program:
-//         - u_localToClip (affine) OR u_homography + u_ortho (perspective)
-//         - u_naturalSize
-//         - u_layerTex (the layer FBO texture)
-//         - u_dstTex (the destFBO texture, for blend modes)
-//         - u_opacity
-//         - u_blendMode
-//         - u_needsBlend (1 if blend != normal)
-//         - u_usePerspective (1 if corners set)
-//      g. Set GL blend state:
-//         - If normal mode: gl.BLEND with ONE/ONE_MINUS_SRC_ALPHA
-//           (premultiplied source-over), shader skips dst read.
-//         - Else: gl.BLEND disabled, shader does manual blend.
-//      h. drawArrays(TRIANGLE_STRIP, 0, 4) — 4 verts = the layer quad.
-//
-//   4. Blit destFBO to the visible canvas (default framebuffer).
-//
-// ────────────────────────────────────────────────────────────
-//
-// BLEND FEEDBACK LOOP NOTE:
-//   For non-normal blend modes, we sample destTexture while rendering
-//   INTO destFBO. This is the classic "feedback loop" forbidden by GL.
-//   WebGL2 allows it under specific conditions:
-//     • Texture bound to a sampler is NOT the same texture object
-//       attached to the current framebuffer's color attachment.
-//   Solution: ping-pong destFBO. We have TWO destination FBOs (A, B).
-//   On each layer:
-//     - Read from "previous" FBO (the accumulated composite so far).
-//     - Write to "current" FBO (adds this layer).
-//     - Swap A/B.
-//   After all layers, the "previous" FBO holds the final result;
-//   blit it to the visible canvas.
 // ============================================================
 
 import type { GLState } from './gl-context';
@@ -64,6 +18,7 @@ import { affineToMat3Array, homographyToMat3Array, orthoCanvasProjection, affine
 import { blendModeToGLSLId, blendModeNeedsDstRead } from './gl-blend';
 import { composeLayerMatrix } from '../transform-matrix';
 import { computeHomography, isQuadDegenerate } from '../homography';
+import { applyHomography, invertHomography } from '../homography';
 import type { Layer, Vec2 } from '../types';
 import type { CompositeContext } from '../composite';
 import { getLayerNaturalSize } from '../types';
@@ -79,9 +34,9 @@ interface DestPingPong {
   texB: WebGLTexture;
   /** Which one is "current read" (holds previous frame's composite). */
   readFromA: boolean;
-  /** Actual FBO width — used to detect size changes (BUG-A FIX). */
+  /** Actual FBO width — used to detect size changes. */
   ppW: number;
-  /** Actual FBO height — used to detect size changes (BUG-A FIX). */
+  /** Actual FBO height — used to detect size changes. */
   ppH: number;
 }
 
@@ -92,12 +47,6 @@ function ensureDestPingPong(state: GLState, w: number, h: number): DestPingPong 
   let existing = destPingPongCache.get(state);
 
   // Validate size — recreate if mismatched.
-  if (existing) {
-    // Check by binding texA and querying — but we cache size externally.
-    // Simpler: store size on the descriptor. We'll add a wrapper type.
-  }
-
-  // BUG FIX: track actual FBO size on the DestPingPong object itself.
   if (existing && existing.ppW === w && existing.ppH === h) {
     return existing;
   }
@@ -108,7 +57,6 @@ function ensureDestPingPong(state: GLState, w: number, h: number): DestPingPong 
     gl.deleteTexture(existing.texA);
     gl.deleteTexture(existing.texB);
     destPingPongCache.delete(state);
-    existing = undefined;
   }
 
   const makeFBO = (): { fbo: WebGLFramebuffer; tex: WebGLTexture } | null => {
@@ -170,18 +118,119 @@ function getCurrentWrite(pp: DestPingPong): { fbo: WebGLFramebuffer; tex: WebGLT
     : { fbo: pp.fboA, tex: pp.texA };
 }
 
+// ── Scanline clipping (for backward mapping) ──
+function getQuadScanline(
+  quad: readonly [Vec2, Vec2, Vec2, Vec2],
+  y: number,
+  minX: number,
+  maxX: number
+): [number, number] | null {
+  const intersections: number[] = [];
+  for (let i = 0; i < 4; i++) {
+    const p1 = quad[i];
+    const p2 = quad[(i + 1) % 4];
+    if ((p1.y < y && p2.y >= y) || (p2.y < y && p1.y >= y)) {
+      if (Math.abs(p2.y - p1.y) < 1e-6) continue;
+      const t = (y - p1.y) / (p2.y - p1.y);
+      const x = p1.x + t * (p2.x - p1.x);
+      intersections.push(x);
+    }
+  }
+  if (intersections.length < 2) return null;
+  intersections.sort((a, b) => a - b);
+  const left = Math.max(minX, Math.floor(intersections[0]));
+  const right = Math.min(maxX, Math.ceil(intersections[intersections.length - 1]));
+  if (left >= right) return null;
+  return [left, right];
+}
+
+// ── Backward mapping (for high-quality bake/export) ──
+export function drawImageWithPerspectiveBackward(
+  destCtx: CanvasRenderingContext2D,
+  srcCanvas: HTMLCanvasElement,
+  srcW: number,
+  srcH: number,
+  dstCorners: readonly [Vec2, Vec2, Vec2, Vec2],
+): void {
+  if (srcW <= 0 || srcH <= 0) return;
+  if (isQuadDegenerate(dstCorners)) return;
+
+  const srcQuad: [Vec2, Vec2, Vec2, Vec2] = [
+    { x: 0, y: 0 }, { x: srcW, y: 0 }, { x: srcW, y: srcH }, { x: 0, y: srcH },
+  ];
+  const H = computeHomography(srcQuad, dstCorners);
+  if (!H) {
+    const xs = dstCorners.map(c => c.x), ys = dstCorners.map(c => c.y);
+    destCtx.drawImage(srcCanvas, Math.min(...xs), Math.min(...ys), Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+    return;
+  }
+
+  const Hinv = invertHomography(H);
+  if (!Hinv) return;
+
+  const xs = dstCorners.map(c => c.x), ys = dstCorners.map(c => c.y);
+  const minX = Math.floor(Math.min(...xs)), maxX = Math.ceil(Math.max(...xs));
+  const minY = Math.floor(Math.min(...ys)), maxY = Math.ceil(Math.max(...ys));
+  const outW = maxX - minX, outH = maxY - minY;
+  if (outW <= 0 || outH <= 0) return;
+
+  const srcCtx = srcCanvas.getContext('2d');
+  if (!srcCtx) return;
+  const srcData = srcCtx.getImageData(0, 0, srcW, srcH);
+  const srcPixels = srcData.data;
+  const outImage = destCtx.createImageData(outW, outH);
+  const outPixels = outImage.data;
+  outPixels.fill(0);
+  const srcStride = srcW * 4;
+
+  for (let y = 0; y < outH; y++) {
+    const dstY = minY + y;
+    const xRange = getQuadScanline(dstCorners, dstY, minX, maxX);
+    if (!xRange) continue;
+    const [startX, endX] = xRange;
+    const x0 = Math.max(0, startX - minX), x1 = Math.min(outW, endX - minX);
+    for (let x = x0; x < x1; x++) {
+      const dstX = minX + x;
+      const src = applyHomography(Hinv, { x: dstX, y: dstY });
+      const sx = src.x, sy = src.y;
+      if (sx < 0 || sx >= srcW || sy < 0 || sy >= srcH) continue;
+      const outIdx = (y * outW + x) * 4;
+      if (sx >= 0 && sx < srcW - 1 && sy >= 0 && sy < srcH - 1) {
+        const x0i = Math.floor(sx), y0i = Math.floor(sy);
+        const fx = sx - x0i, fy = sy - y0i;
+        const i00 = (y0i * srcW + x0i) * 4, i10 = i00 + 4, i01 = i00 + srcStride, i11 = i01 + 4;
+        for (let c = 0; c < 4; c++) {
+          const v00 = srcPixels[i00 + c], v10 = srcPixels[i10 + c], v01 = srcPixels[i01 + c], v11 = srcPixels[i11 + c];
+          const v0 = v00 + fx * (v10 - v00), v1 = v01 + fx * (v11 - v01);
+          outPixels[outIdx + c] = Math.round(v0 + fy * (v1 - v0));
+        }
+      } else {
+        const xi = Math.min(Math.floor(sx), srcW - 1), yi = Math.min(Math.floor(sy), srcH - 1);
+        const i0 = (yi * srcW + xi) * 4;
+        outPixels[outIdx + 0] = srcPixels[i0 + 0];
+        outPixels[outIdx + 1] = srcPixels[i0 + 1];
+        outPixels[outIdx + 2] = srcPixels[i0 + 2];
+        outPixels[outIdx + 3] = srcPixels[i0 + 3];
+      }
+    }
+  }
+
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = outW; tempCanvas.height = outH;
+  const tempCtx = tempCanvas.getContext('2d');
+  if (!tempCtx) return;
+  tempCtx.putImageData(outImage, 0, 0);
+  destCtx.drawImage(tempCanvas, minX, minY);
+}
+
 // ────────────────────────────────────────────────────────────
 // Main composite entry
 // ────────────────────────────────────────────────────────────
 
+const MAX_HARDWARE_TEX_LIMIT = 16384;
+
 /**
  * Composite all visible layers onto the canvas via WebGL2.
- *
- * @param state       GLState from createGLState
- * @param canvas      Target canvas (must be the same one used to create state)
- * @param layers      Layers, bottom-to-top
- * @param compositeCtx Document size + image cache
- * @returns true on success, false on any failure (caller falls back to 2D)
  */
 export function compositeLayersGL(
   state: GLState,
@@ -198,28 +247,29 @@ export function compositeLayersGL(
   // ── Step 1: ensure FBOs match canvas size ──────────────────
   if (!ensureGLStateSize(state, w, h)) {
     if (typeof console !== 'undefined' && console.warn) {
-      console.warn('[GenTonik WebGL] ensureGLStateSize failed', { w, h, canvasW: state.canvasW, canvasH: state.canvasH, lost: state.lost });
+      console.warn('[GenTonik WebGL] ensureGLStateSize failed', { w, h, canvasW: state.canvasW, canvasH: state.canvasH, renderW: state.renderW, renderH: state.renderH, lost: state.lost });
     }
     return false;
   }
-  const pp = ensureDestPingPong(state, w, h);
+  const pp = ensureDestPingPong(state, state.renderW, state.renderH);
   if (!pp) {
     if (typeof console !== 'undefined' && console.warn) {
-      console.warn('[GenTonik WebGL] ensureDestPingPong failed', { w, h });
+      console.warn('[GenTonik WebGL] ensureDestPingPong failed', { renderW: state.renderW, renderH: state.renderH });
     }
     return false;
   }
 
   try {
     // ── Step 2: clear BOTH dest FBOs to transparent ──────────
-    // (Both because we may read from either depending on ping-pong state.)
     gl.bindFramebuffer(gl.FRAMEBUFFER, pp.fboA);
-    gl.viewport(0, 0, w, h);
-    gl.scissor(0, 0, w, h);
+    gl.viewport(0, 0, state.renderW, state.renderH);
+    gl.scissor(0, 0, state.renderW, state.renderH);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, pp.fboB);
+    gl.viewport(0, 0, state.renderW, state.renderH);
+    gl.scissor(0, 0, state.renderW, state.renderH);
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
@@ -235,11 +285,6 @@ export function compositeLayersGL(
           console.warn('[GenTonik WebGL] compositeSingleLayerGL failed at layer', i, {
             name: layer.name,
             type: layer.type,
-            visible: layer.visible,
-            opacity: layer.opacity,
-            hasMask: !!layer.mask,
-            maskType: layer.mask?.type,
-            hasCanvasSpacePolygon: layer.mask?.type === 'painted' && !!(layer.mask as { canvasSpacePolygon?: unknown }).canvasSpacePolygon,
           });
         }
         return false;
@@ -253,7 +298,7 @@ export function compositeLayersGL(
     gl.viewport(0, 0, w, h);
     gl.scissor(0, 0, w, h);
     gl.blitFramebuffer(
-      0, 0, w, h,
+      0, 0, state.renderW, state.renderH,
       0, 0, w, h,
       gl.COLOR_BUFFER_BIT,
       gl.NEAREST,
@@ -287,10 +332,6 @@ function compositeSingleLayerGL(
   });
   let renderW = naturalSize.w;
   let renderH = naturalSize.h;
-  // Solid layers are 1×1 naturally but stretched to docSize at render
-  // time. Transparent layers have no intrinsic content but need a sane
-  // render box so transforms/masks behave correctly — same docSize override.
-  // v2.9: text/vector layers also get docSize override (no intrinsic size).
   if (layer.type === 'solid' || layer.type === 'transparent'
       || layer.type === 'text' || layer.type === 'vector') {
     renderW = compositeCtx.docWidth;
@@ -310,10 +351,7 @@ function compositeSingleLayerGL(
     return false;
   }
 
-  // ── Apply mask (in-place ping-pong inside applyMaskGL) ────
-  // PRESERVE-PERSPECTIVE: skip layer-local painted mask if canvasSpacePolygon
-  // is set — that mask is applied as a canvas-space clip in the composite
-  // shader (u_canvasClipTex), not as a layer-local alpha multiply.
+  // ── Apply mask ────
   if (layer.mask) {
     const hasCanvasSpaceMask = layer.mask.type === 'painted' && (layer.mask as { canvasSpacePolygon?: unknown }).canvasSpacePolygon;
     if (!hasCanvasSpaceMask) {
@@ -323,20 +361,7 @@ function compositeSingleLayerGL(
     }
   }
 
-  // v2.12: REMOVED generateMipmap — mipmaps turn crisp manga dots into
-  // gray mush. Moire is addressed via fwidth()+smoothstep() in the
-  // composite fragment shader instead.
-
-  // PRESERVE-PERSPECTIVE: rasterize canvas-space clip polygon → texture.
-  // The polygon is in canvas-pixel space. We rasterize it to a single-channel
-  // alpha texture (canvasW × canvasH) using an offscreen Canvas2D, then
-  // upload as a GL texture. The composite-quad shader samples this texture
-  // to clip the layer to the polygon shape (post-perspective).
-  //
-  // PERFORMANCE: texture is cached per-layer (keyed by layer.id). The cache
-  // hits on every frame after the first, avoiding the expensive 2000×2000
-  // Canvas2D rasterization. Cache invalidates automatically when the polygon
-  // changes (new mask) or canvas resizes.
+  // Rasterize canvas-space clip polygon → texture.
   let canvasClipTex: WebGLTexture | null = null;
   const canvasSpacePolygon = layer.mask?.type === 'painted'
     ? (layer.mask as { canvasSpacePolygon?: Vec2[] }).canvasSpacePolygon
@@ -344,64 +369,29 @@ function compositeSingleLayerGL(
   const useCanvasClip = !!(canvasSpacePolygon && canvasSpacePolygon.length >= 3);
   if (useCanvasClip && canvasSpacePolygon) {
     canvasClipTex = getCanvasClipTexture(state, layer.id, canvasSpacePolygon, state.canvasW, state.canvasH);
-    if (!canvasClipTex) {
-      // Rasterization failed — skip canvas clip (fall back to no clip).
-      // The layer will render without clipping (acceptable degradation).
-    }
   }
 
   // ── Composite onto destination (ping-pong) ────────────────
   const readDest = getCurrentRead(pp);
   const writeDest = getCurrentWrite(pp);
 
-  // CRITICAL FIX (2026-06-28): blit readDest → writeDest before drawing.
-  //
-  // The fragment shader only executes for pixels inside the layer's quad.
-  // Pixels OUTSIDE the quad in writeDest would retain stale content from
-  // a previous frame or from the initial clear. This causes the accumulated
-  // composite (lower layers) to be lost outside the quad area.
-  //
-  // Symptom: with a Free Transform layer on top, layers below are invisible
-  // outside the FT quad. With 2 layers under FT, the bottommost layer
-  // "reappears" as stale content from a previous ping-pong cycle.
-  //
-  // Fix: copy the accumulated composite (readDest) into writeDest FIRST,
-  // then draw the current layer on top. The shader's blendPremultiplied()
-  // overwrites pixels inside the quad with the correct blended result.
-  // Pixels outside the quad retain the accumulated composite from the blit.
   gl.bindFramebuffer(gl.READ_FRAMEBUFFER, readDest.fbo);
   gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, writeDest.fbo);
   gl.blitFramebuffer(
-    0, 0, state.canvasW, state.canvasH,
-    0, 0, state.canvasW, state.canvasH,
+    0, 0, state.renderW, state.renderH,
+    0, 0, state.renderW, state.renderH,
     gl.COLOR_BUFFER_BIT,
     gl.NEAREST,
   );
 
   // Bind writeDest as render target.
   gl.bindFramebuffer(gl.FRAMEBUFFER, writeDest.fbo);
-  gl.viewport(0, 0, state.canvasW, state.canvasH);
-  gl.scissor(0, 0, state.canvasW, state.canvasH);
+  gl.viewport(0, 0, state.renderW, state.renderH);
+  gl.scissor(0, 0, state.renderW, state.renderH);
 
   const needsDstRead = blendModeNeedsDstRead(layer.blendMode);
   const blendId = blendModeToGLSLId(layer.blendMode);
 
-  // ── BLEND STATE ───────────────────────────────────────────
-  //
-  // CRITICAL FIX (2026-06-27): always disable gl.BLEND. The shader
-  // does ALL blending manually (samples u_dstTex = readDest.tex and
-  // applies blendPremultiplied). The previous version enabled gl.BLEND
-  // for normal mode, expecting GL fixed-function src-over — but that
-  // uses the CURRENT framebuffer's content as dst, which is writeDest
-  // (the empty half of the ping-pong). The accumulated composite is
-  // in readDest.tex, which GL fixed-function can't see. So lower
-  // layers were silently dropped. Now the shader always samples dst
-  // from u_dstTex and does correct src-over for all blend modes.
-  //
-  // `needsDstRead` is kept for ABI compat but the shader ignores it
-  // (it always reads dst). We leave the variable in place to minimize
-  // the diff and to allow easy reversion if a future optimization
-  // restores the GL fixed-function fast path for the first layer.
   gl.disable(gl.BLEND);
   void needsDstRead;
 
@@ -416,7 +406,7 @@ function compositeSingleLayerGL(
   gl.bindTexture(gl.TEXTURE_2D, layerFBO.tex);
   gl.uniform1i(gl.getUniformLocation(prog, 'u_layerTex'), 0);
 
-  // Bind readDest texture as u_dstTex (only used if needsDstRead).
+  // Bind readDest texture as u_dstTex.
   gl.activeTexture(gl.TEXTURE1);
   gl.bindTexture(gl.TEXTURE_2D, readDest.tex);
   gl.uniform1i(gl.getUniformLocation(prog, 'u_dstTex'), 1);
@@ -429,30 +419,24 @@ function compositeSingleLayerGL(
   // Uniforms: natural size.
   gl.uniform2f(gl.getUniformLocation(prog, 'u_naturalSize'), renderW, renderH);
 
-  // Uniforms: canvas size (needed for perspective-correct interpolation
-  // in COMPOSITE_VERT — it uses u_canvasSize to compute clip-space
-  // homogeneous coordinates without dividing by canvasPos.z).
+  // Uniforms: canvas size (logical).
   gl.uniform2f(gl.getUniformLocation(prog, 'u_canvasSize'), state.canvasW, state.canvasH);
 
-  // PRESERVE-PERSPECTIVE: canvas-space clip mask texture + enable flag.
-  // Bind to texture unit 2 (0 = layerTex, 1 = dstTex, 2 = canvasClipTex).
-  // NOTE: u_canvasSize is shared between COMPOSITE_VERT (perspective math)
-  // and COMPOSITE_FRAG (canvas-clip UV). Both use the same value.
+  // Uniforms: FBO render size (physical).
+  gl.uniform2f(gl.getUniformLocation(prog, 'u_renderSize'), state.renderW, state.renderH);
+
   if (useCanvasClip && canvasClipTex) {
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, canvasClipTex);
     gl.uniform1i(gl.getUniformLocation(prog, 'u_canvasClipTex'), 2);
     gl.uniform1i(gl.getUniformLocation(prog, 'u_useCanvasClip'), 1);
   } else {
-    // Disable clip: bind no texture (or a dummy), set flag to 0.
     gl.uniform1i(gl.getUniformLocation(prog, 'u_useCanvasClip'), 0);
   }
 
   // ── Transform uniforms: affine or perspective ────────────
   if (layer.transform.corners) {
-    // Perspective path: compute homography.
     if (isQuadDegenerate(layer.transform.corners)) {
-      // Skip degenerate quads (matches composite.ts behavior).
       swapPingPong(pp);
       return true;
     }
@@ -464,7 +448,6 @@ function compositeSingleLayerGL(
     ] as const;
     const H = computeHomography(srcQuad, layer.transform.corners);
     if (!H) {
-      // Fallback: skip (matches composite.ts).
       swapPingPong(pp);
       return true;
     }
@@ -472,7 +455,6 @@ function compositeSingleLayerGL(
     gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'u_homography'), false, homography);
     gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'u_ortho'), false, ortho);
     gl.uniform1i(gl.getUniformLocation(prog, 'u_usePerspective'), 1);
-    // u_localToClip is unused in perspective path — set to identity to avoid GL warnings.
     gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'u_localToClip'), false, new Float32Array([1,0,0,0,1,0,0,0,1]));
   } else {
     // Affine path.
@@ -484,26 +466,12 @@ function compositeSingleLayerGL(
     const screenToClip = affineScreenToClip(m, state.canvasW, state.canvasH);
     gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'u_localToClip'), false, screenToClip);
     gl.uniform1i(gl.getUniformLocation(prog, 'u_usePerspective'), 0);
-    // u_homography and u_ortho unused — set to identity.
     gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'u_homography'), false, new Float32Array([1,0,0,0,1,0,0,0,1]));
     gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'u_ortho'), false, new Float32Array([1,0,0,0,1,0,0,0,1]));
   }
 
-  // ── Draw 4-vertex triangle strip (the layer quad) ─────────
-  // The vertex shader builds quad coords via gl_VertexID — no VBO needed.
-  // BUT we're using gl_VertexID 0..3 with switch() expecting 4 verts.
-  // So drawArrays must be TRIANGLE_STRIP with 4 verts.
-  //
-  // Wait — the vertex shader's switch() expects gl_VertexID 0..3, which
-  // works for both TRIANGLE_STRIP and TRIANGLES + 6-vert expansion.
-  // We use TRIANGLE_STRIP for efficiency.
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-  // PRESERVE-PERSPECTIVE: canvas-clip texture is cached — do NOT delete here.
-  // The cache (getCanvasClipTexture) owns the texture and reuses it across
-  // frames. It's deleted only when the polygon changes or canvas resizes.
-
-  // ── Swap ping-pong for next layer ────────────────────────
   swapPingPong(pp);
 
   // Restore GL state for next pass.
@@ -512,57 +480,23 @@ function compositeSingleLayerGL(
 }
 
 // ────────────────────────────────────────────────────────────
-// PRESERVE-PERSPECTIVE: rasterize canvas-space clip polygon → GL texture.
+// clipTextureCache definitions
 // ────────────────────────────────────────────────────────────
 
-/**
- * Cached canvas-clip texture entry.
- *
- * Rasterizing a polygon to a canvasW × canvasH texture every frame is
- * expensive (e.g. 2000×2000 = 16MB RGBA). The clip polygon only changes
- * when the user creates a new "Mask from Sel → by canvas shape" — it does
- * NOT change during pan/zoom or while editing other layers. So we cache
- * the texture by a hash of (polygon points + canvas size).
- *
- * The cache is keyed by layer.id (one clip texture per layer). When the
- * layer's mask changes, the old texture is deleted and a new one is created.
- * When the canvas resizes, all entries are invalidated.
- */
 interface ClipTextureCacheEntry {
   texture: WebGLTexture;
-  /** Hash of polygon points + canvas size — detects mask changes. */
   hash: string;
-  /** Canvas size when this texture was created — detects resize. */
   canvasW: number;
   canvasH: number;
 }
 
 const clipTextureCache = new WeakMap<GLState, Map<string, ClipTextureCacheEntry>>();
 
-/**
- * Compute a hash of the polygon + canvas size for cache lookup.
- * Uses a simple string concatenation — fast enough for typical polygon
- * sizes (16-64 points from ellipse/lasso selections).
- */
-function hashClipKey(polygon: Vec2[], canvasW: number, canvasH: number): string {
-  // Round to 0.1 px to avoid float jitter creating new cache entries.
-  // The rounding error is negligible for clip mask purposes.
+function hashClipKey(polygon: Vec2[], renderScale: number): string {
   const rounded = polygon.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join('|');
-  return `${canvasW}x${canvasH}:${rounded}`;
+  return `${renderScale.toFixed(6)}:${rounded}`;
 }
 
-/**
- * Get or create a canvas-clip texture for the given polygon + canvas size.
- * Uses a per-GLState cache (keyed by layer.id passed via `cacheKey`).
- *
- * @param state        GL state (cache is per-state)
- * @param cacheKey     Unique key per layer (typically layer.id)
- * @param polygon      Canvas-space clip polygon
- * @param canvasW      Canvas width in px
- * @param canvasH      Canvas height in px
- * @returns GL texture, or null on failure. Caller must NOT delete the
- *          returned texture — it's owned by the cache.
- */
 function getCanvasClipTexture(
   state: GLState,
   cacheKey: string,
@@ -573,7 +507,7 @@ function getCanvasClipTexture(
   const { gl } = state;
   if (polygon.length < 3 || canvasW <= 0 || canvasH <= 0) return null;
 
-  const hash = hashClipKey(polygon, canvasW, canvasH);
+  const hash = hashClipKey(polygon, state.renderScale);
 
   let cache = clipTextureCache.get(state);
   if (!cache) {
@@ -583,11 +517,9 @@ function getCanvasClipTexture(
 
   const existing = cache.get(cacheKey);
   if (existing) {
-    // Cache hit — check if polygon or canvas size changed.
     if (existing.hash === hash && existing.canvasW === canvasW && existing.canvasH === canvasH) {
       return existing.texture;
     }
-    // Polygon or canvas changed — delete old texture, create new.
     gl.deleteTexture(existing.texture);
     cache.delete(cacheKey);
   }
@@ -600,19 +532,6 @@ function getCanvasClipTexture(
   return texture;
 }
 
-/**
- * Rasterize a canvas-space polygon to a single-channel alpha texture
- * (canvasW × canvasH) and upload it as a GL texture.
- *
- * The polygon is in canvas-pixel space (0..canvasW, 0..canvasH), top-left origin
- * (Canvas2D convention). The resulting texture has alpha=255 inside the polygon
- * and alpha=0 outside.
- *
- * The composite-quad shader samples this texture with Y flipped (WebGL Y is
- * bottom-up) to clip the layer to the polygon shape.
- *
- * @returns GL texture, or null on failure.
- */
 function rasterizeCanvasClipToTexture(
   state: GLState,
   polygon: Vec2[],
@@ -620,23 +539,22 @@ function rasterizeCanvasClipToTexture(
   canvasH: number,
 ): WebGLTexture | null {
   const { gl } = state;
-  if (polygon.length < 3 || canvasW <= 0 || canvasH <= 0) return null;
+  if (polygon.length < 3 || state.renderW <= 0 || state.renderH <= 0) return null;
 
   try {
-    // Use an offscreen Canvas2D to rasterize the polygon.
-    // (We can't use the main canvas — it has a WebGL context.)
     const offscreen = document.createElement('canvas');
-    offscreen.width = canvasW;
-    offscreen.height = canvasH;
+    offscreen.width = state.renderW;
+    offscreen.height = state.renderH;
     const ctx = offscreen.getContext('2d');
     if (!ctx) return null;
 
-    // Fill polygon with white (alpha=255 inside, 0 outside).
+    // Scale polygon from logical canvas space to physical render space
+    const s = state.renderScale;
     ctx.fillStyle = '#ffffff';
     ctx.beginPath();
-    ctx.moveTo(polygon[0].x, polygon[0].y);
+    ctx.moveTo(polygon[0].x * s, polygon[0].y * s);
     for (let i = 1; i < polygon.length; i++) {
-      ctx.lineTo(polygon[i].x, polygon[i].y);
+      ctx.lineTo(polygon[i].x * s, polygon[i].y * s);
     }
     ctx.closePath();
     ctx.fill();
@@ -665,17 +583,6 @@ function rasterizeCanvasClipToTexture(
 
 import { compositeLayers } from '../composite';
 
-/**
- * Try WebGL2 composite; on any failure, silently fall back to 2D
- * compositeLayers. The GLState is preserved across calls (cached
- * on the canvas via WeakMap) so a transient failure doesn't
- * permanently disable WebGL.
- *
- * This is the function App.tsx should call in its composite useEffect.
- *
- * During dev: silent fallback (no UI warning).
- * Final GenTonik release: toast notification (TBD).
- */
 const glStateCache = new WeakMap<HTMLCanvasElement, GLState>();
 
 export function compositeLayersWithFallback(
@@ -683,24 +590,21 @@ export function compositeLayersWithFallback(
   layers: Layer[],
   compositeCtx: CompositeContext,
 ): void {
-  // PRESERVE-PERSPECTIVE: canvas-space masks (canvasSpacePolygon) are now
-  // handled natively in the WebGL composite shader (u_canvasClipTex +
-  // u_useCanvasClip). No Canvas2D fallback needed for canvas-space masks.
-  // The previous fallback was broken anyway — canvas.getContext('2d') returns
-  // null when the canvas already has a WebGL context (HTML5 Canvas can only
-  // have one context type).
+  // Early fallback for oversized documents
+  if (canvas.width > MAX_HARDWARE_TEX_LIMIT || canvas.height > MAX_HARDWARE_TEX_LIMIT) {
+    const ctx2d = canvas.getContext('2d');
+    if (ctx2d) {
+      ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+      compositeLayers(ctx2d, layers, compositeCtx);
+      return;
+    }
+    console.error('[GenTonik] Canvas too large for GPU and 2D unavailable');
+    return;
+  }
 
   // Try to get cached GL state, or create new one.
   let state: GLState | null | undefined = glStateCache.get(canvas);
-  // v2.7: If the cached state was marked lost (context loss + restore),
-  // tear it down and create a fresh one. The old GL resources (FBOs,
-  // textures, programs) are invalid after context restore — using them
-  // would produce GL errors or silent no-ops. destroyGLState frees the
-  // stale handles (best-effort) and removes event listeners.
   if (state && state.lost) {
-    if (typeof console !== 'undefined' && console.info) {
-      console.info('[GenTonik WebGL] rebuilding GLState after context loss/restore');
-    }
     destroyGLState(state);
     glStateCache.delete(canvas);
     state = null;
@@ -715,38 +619,21 @@ export function compositeLayersWithFallback(
     const ok = compositeLayersGL(state, canvas, layers, compositeCtx);
     if (ok) return;
 
-    // WebGL failed — log the reason for debugging the "transparent layers" bug.
     if (typeof console !== 'undefined' && console.warn) {
-      console.warn('[GenTonik WebGL] compositeLayersGL returned false — falling back to 2D (which may also fail since canvas already has WebGL context)');
+      console.warn('[GenTonik WebGL] compositeLayersGL returned false — falling back to 2D');
     }
 
-    // WebGL failed — if state is permanently lost, evict from cache.
     if (state.lost) {
       glStateCache.delete(canvas);
       destroyGLState(state);
     }
   }
 
-  // ── Fallback: canvas2D ──────────────────────────────────
-  // NOTE: This fallback only works if the canvas does NOT already have a
-  // WebGL context. In GenToniK the canvas always has WebGL (created on first
-  // composite call), so this fallback path is effectively dead code. It's
-  // kept for safety (e.g. if WebGL2 is unavailable on first run).
+  // Fallback: canvas2D
   const ctx2d = canvas.getContext('2d');
   if (!ctx2d) {
-    // BUG-transparent-diagnostic: log loudly so the user can see WHY
-    // canvas stays transparent. Common causes:
-    //   1. WebGL composite failed silently (shader compile error, FBO incomplete)
-    //   2. Canvas already has WebGL context → getContext('2d') returns null
-    //   3. All layers invisible or zero opacity
     if (typeof console !== 'undefined' && console.error) {
-      const visibleLayerCount = layers.filter(l => l.visible && l.opacity > 0).length;
-      console.error('[GenTonik WebGL] FATAL: WebGL composite failed AND canvas2D fallback unavailable. Canvas will be transparent.', {
-        visibleLayerCount,
-        totalLayerCount: layers.length,
-        layersSummary: layers.map(l => ({ name: l.name, type: l.type, visible: l.visible, opacity: l.opacity, hasMask: !!l.mask })),
-        docSize: { w: canvas.width, h: canvas.height },
-      });
+      console.error('[GenTonik WebGL] FATAL: WebGL composite failed AND canvas2D fallback unavailable.');
     }
     return;
   }
@@ -754,6 +641,4 @@ export function compositeLayersWithFallback(
   compositeLayers(ctx2d, layers, compositeCtx);
 }
 
-// Re-export createGLState so consumers can manage lifecycle explicitly.
-// (Already imported above; re-exported here for the public API.)
 export { createGLState, destroyGLState } from './gl-context';

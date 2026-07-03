@@ -62,6 +62,7 @@ import { computeHomography, applyHomography } from './homography';
 import { toPx, fromPx } from './units';
 import * as presetStore from './preset-store';
 import { getInputManager } from './input-manager';
+import { calculateStraightenAngle, lineAngle, distance } from './utils/geometry';
 import {
   saveOraFile, openOraFile, isOraFile, ORA_FILE_ACCEPT,
   type OraImportResult,
@@ -1706,6 +1707,10 @@ interface CanvasViewProps {
   measureLine?: { start: { x: number; y: number }; end: { x: number; y: number } } | null;
   /** v2.14: DPI for measure label conversion. */
   dpi?: number;
+  /** v2.15: Straighten layer callback — rotates layer to align with measured line. */
+  onStraighten?: () => void;
+  /** v2.15: Whether straighten is available (only for image layers). */
+  canStraighten?: boolean;
 }
 
 /** v2.5: Zoom tool zoom factor per click. */
@@ -1716,6 +1721,7 @@ const ZOOM_DRAG_THRESHOLD = 5;
 function CanvasView({
   canvasRef, docSize, zoom, panX, panY, onZoom, onPan, selectedLayer, compositeCtx,
   activeTool, onBucketFill, onMeasureStart, onMeasureMove, onMeasureEnd, measureLine, dpi,
+  onStraighten, canStraighten,
 }: CanvasViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ startX: number; startY: number; panX: number; panY: number } | null>(null);
@@ -1951,6 +1957,8 @@ function CanvasView({
         ? 'crosshair'
         : (dragRef.current ? 'grabbing' : 'default');
 
+  const docNeedsWebGL = docSize && docSize.w > 0 && docSize.w <= 16384 && docSize.h <= 16384;
+
   return (
     <div
       ref={containerRef}
@@ -2002,6 +2010,7 @@ function CanvasView({
           }}
         />
         <canvas
+          key={docNeedsWebGL ? 'webgl' : 'canvas2d'}
           ref={canvasRef}
           style={{
             position: 'absolute',
@@ -2052,18 +2061,28 @@ function CanvasView({
 
       {/* Zoom badge removed — zoom/dims/DPI now live in the bottom Status Bar */}
 
-      {/* v2.14: Measure tool overlay — line + distance/angle label */}
+      {/* v2.14: Measure tool overlay — line + distance/angle label + Straighten button */}
       {activeTool === 'measure' && measureLine && (
-        <MeasureOverlay line={measureLine} panX={panX} panY={panY} zoom={zoom} dpi={dpi} />
+        <MeasureOverlay
+          line={measureLine}
+          panX={panX}
+          panY={panY}
+          zoom={zoom}
+          dpi={dpi}
+          onStraighten={onStraighten}
+          canStraighten={canStraighten}
+        />
       )}
     </div>
   );
 }
 
-// v2.14: Measure overlay component
-function MeasureOverlay({ line, panX, panY, zoom, dpi = 300 }: {
+// v2.15: Measure overlay component — line + distance/angle + Straighten button
+function MeasureOverlay({ line, panX, panY, zoom, dpi = 300, onStraighten, canStraighten }: {
   line: { start: { x: number; y: number }; end: { x: number; y: number } };
   panX: number; panY: number; zoom: number; dpi?: number;
+  onStraighten?: () => void;
+  canStraighten?: boolean;
 }) {
   const sx = panX + line.start.x * zoom;
   const sy = panY + line.start.y * zoom;
@@ -2073,12 +2092,17 @@ function MeasureOverlay({ line, panX, panY, zoom, dpi = 300 }: {
   const dy = line.end.y - line.start.y;
   const distPx = Math.sqrt(dx * dx + dy * dy);
   const distMm = (distPx * 25.4) / dpi;
-  const angleRad = Math.atan2(dy, dx);
-  const angleDeg = (angleRad * 180) / Math.PI;
+  const angleDeg = lineAngle(line.start, line.end);
+  const straightenAngle = calculateStraightenAngle(line.start, line.end);
 
   // Label position: midpoint of the line, offset above
   const midX = (sx + ex) / 2;
   const midY = (sy + ey) / 2;
+
+  // Determine axis label
+  const absAngle = Math.abs(angleDeg);
+  const isHorizontal = Math.min(absAngle, 180 - absAngle) <= Math.abs(90 - absAngle);
+  const axisLabel = isHorizontal ? 'X' : 'Y';
 
   const label = `${distPx.toFixed(1)}px (${distMm.toFixed(1)}mm) · ${angleDeg.toFixed(1)}°`;
 
@@ -2114,6 +2138,30 @@ function MeasureOverlay({ line, panX, panY, zoom, dpi = 300 }: {
       }}>
         {label}
       </div>
+      {/* Straighten button — only for raster layers (image type) */}
+      {canStraighten && onStraighten && distPx > 5 && (
+        <button
+          onClick={onStraighten}
+          style={{
+            position: 'absolute',
+            left: midX + 8, top: midY + 4,
+            pointerEvents: 'auto',
+            background: 'rgba(0, 170, 255, 0.95)',
+            color: '#fff',
+            fontSize: 11,
+            fontWeight: 600,
+            padding: '4px 10px',
+            border: 'none',
+            borderRadius: 3,
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+            fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+          }}
+          title={`Straighten layer: rotate by ${straightenAngle.toFixed(1)}° to align with ${axisLabel} axis`}
+        >
+          ↻ Straighten ({straightenAngle.toFixed(1)}° → {axisLabel})
+        </button>
+      )}
     </div>
   );
 }
@@ -6093,6 +6141,20 @@ export default function App() {
                 onMeasureEnd={() => { /* keep line visible after drag ends */ }}
                 measureLine={measureLine}
                 dpi={dpi}
+                onStraighten={() => {
+                  if (!selectedLayer || selectedLayer.type !== 'image' || !measureLine) return;
+                  const angle = calculateStraightenAngle(measureLine.start, measureLine.end);
+                  pushHistory('Straighten Layer');
+                  const newLayers = layers.map(l =>
+                    l.id === selectedLayer.id
+                      ? { ...l, transform: { ...l.transform, rotation: l.transform.rotation + angle }, updatedAt: Date.now() }
+                      : l
+                  );
+                  setLayers(newLayers);
+                  setMeasureLine(null);
+                  debug.info('ui', `Straightened layer "${selectedLayer.name}" by ${angle.toFixed(1)}°`);
+                }}
+                canStraighten={!!selectedLayer && selectedLayer.type === 'image'}
               />
               {selectedLayer && (
                 <TransformOverlayCanvas

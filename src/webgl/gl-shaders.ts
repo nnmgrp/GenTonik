@@ -209,6 +209,7 @@ uniform int       u_needsBlend; // DEPRECATED — kept for ABI compat, ignored.
 uniform sampler2D u_canvasClipTex;  // canvas-space clip mask (alpha channel)
 uniform int       u_useCanvasClip;  // 0 = disabled, 1 = enabled
 uniform vec2      u_canvasSize;     // canvas px size (for converting gl_FragCoord → mask UV)
+uniform vec2      u_renderSize;     // physical FBO size (renderW, renderH)
 
 in  vec2 v_uv;
 out vec4 outColor;
@@ -225,8 +226,8 @@ void main() {
   // convention). We flip Y when computing the mask UV.
   if (u_useCanvasClip == 1) {
     vec2 maskUV = vec2(
-      gl_FragCoord.x / u_canvasSize.x,
-      1.0 - (gl_FragCoord.y / u_canvasSize.y)
+      gl_FragCoord.x / u_renderSize.x,
+      1.0 - (gl_FragCoord.y / u_renderSize.y)
     );
     float clipAlpha = texture(u_canvasClipTex, maskUV).a;
     if (clipAlpha < 0.5) {
