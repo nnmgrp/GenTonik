@@ -65,8 +65,9 @@ export type DebugCategory =
   | 'engine'
   | 'ui'
   | 'system'
-  | 'bake'   // v2.9.1: Bake Transform
-  | 'doc';   // v2.9.1: Document-level operations (color profile conversion etc.)
+  | 'bake'    // v2.9.1: Bake Transform
+  | 'doc'     // v2.9.1: Document-level operations (color profile conversion etc.)
+  | 'export'; // v2.16: Image export (PNG/JPG/TIFF/AVIF, tiled rendering)
 
 export type DebugLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace';
 
@@ -932,6 +933,7 @@ const CATEGORY_COLORS: Record<DebugCategory, string> = {
   system: '#666',
   bake: '#ff6347',    // v2.9.1
   doc: '#4682b4',     // v2.9.1
+  export: '#00ced1',  // v2.16 — dark turquoise
 };
 
 // ────────────────────────────────────────────────────────────

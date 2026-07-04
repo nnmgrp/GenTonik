@@ -67,6 +67,8 @@ import {
   saveOraFile, openOraFile, isOraFile, ORA_FILE_ACCEPT,
   type OraImportResult,
 } from './ora-format';
+// v2.16: Multi-format image export (PNG/JPG/TIFF/AVIF) with tiled rendering.
+import { exportImage, type ImageFormat } from './image-export';
 
 // ── NEW (v2.1): History (undo/redo) ───────────────────────────
 import {
@@ -1687,6 +1689,8 @@ function PresetEditorModal({ preset, currentParams, onClose, onSave }: PresetEdi
 
 interface CanvasViewProps {
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
+  /** v2.18: Forces <canvas> DOM node recreation on fatal WebGL loss. */
+  canvasKey?: number;
   docSize: { w: number; h: number };
   zoom: number;
   panX: number;
@@ -1699,10 +1703,12 @@ interface CanvasViewProps {
   activeTool: ToolId;
   /** v2.10: Bucket fill callback — called on click when activeTool === 'bucket'. */
   onBucketFill?: () => void;
-  /** v2.14: Measure tool callbacks. */
-  onMeasureStart?: (docX: number, docY: number) => void;
+  /** v2.15: Measure tool — two-click ruler. Click 1 = P1, move = preview, click 2 = P2, click 3 = reset + new. */
+  onMeasureClick?: (docX: number, docY: number) => void;
+  /** v2.15: Live preview callback while in 'placing' mode (cursor moves after P1). */
   onMeasureMove?: (docX: number, docY: number) => void;
-  onMeasureEnd?: () => void;
+  /** v2.15: Current measure phase: 'idle' (no line) | 'placing' (P1 set, previewing) | 'complete' (P2 set). */
+  measureMode?: 'idle' | 'placing' | 'complete';
   /** v2.14: Current measure line for overlay rendering. */
   measureLine?: { start: { x: number; y: number }; end: { x: number; y: number } } | null;
   /** v2.14: DPI for measure label conversion. */
@@ -1719,10 +1725,17 @@ const ZOOM_TOOL_FACTOR = 1.5;
 const ZOOM_DRAG_THRESHOLD = 5;
 
 function CanvasView({
-  canvasRef, docSize, zoom, panX, panY, onZoom, onPan, selectedLayer, compositeCtx,
-  activeTool, onBucketFill, onMeasureStart, onMeasureMove, onMeasureEnd, measureLine, dpi,
+  canvasRef, canvasKey, docSize, zoom, panX, panY, onZoom, onPan, selectedLayer, compositeCtx,
+  activeTool, onBucketFill, onMeasureClick, onMeasureMove, measureMode, measureLine, dpi,
   onStraighten, canStraighten,
 }: CanvasViewProps) {
+  // v2.16.1: Guard — don't render canvas when no document is active.
+  // This prevents WebGL context creation with 0×0 canvas (which would
+  // produce GL errors) and shows the splash screen instead.
+  if (!docSize || docSize.w <= 0 || docSize.h <= 0) {
+    return null;
+  }
+
   const containerRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ startX: number; startY: number; panX: number; panY: number } | null>(null);
 
@@ -1735,6 +1748,12 @@ function CanvasView({
     if (!selectedLayer) return null;
     return getLayerCanvasBounds(selectedLayer, compositeCtx);
   }, [selectedLayer, compositeCtx]);
+
+  // v2.18: WebGL context lifecycle is now managed globally in App.tsx via
+  // rendererState state machine + canvasKey. CanvasView no longer calls
+  // loseContext() on unmount — the canvas is persistent across tab switches.
+  // Context loss is handled by gl-context.ts event listeners (preventDefault
+  // + wait for restore, 5s timeout → canvasKey++ → Canvas2D fallback).
 
   // v2.12: Native wheel listener with passive:false for reliable preventDefault.
   // React's onWheel is passive in some browsers → preventDefault is ignored
@@ -1807,7 +1826,11 @@ function CanvasView({
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
-    // v2.14: Measure tool — start drag to measure distance/angle
+    // v2.15: Measure tool — two-click ruler.
+    //   Click 1 (when idle OR complete): place P1, start previewing.
+    //   Click 2 (when placing): finalize P2.
+    //   Click 3 (when complete): reset AND start a new measurement at the click point.
+    //   Right-click: cancel current measurement (reset to idle).
     if (activeTool === 'measure' && e.button === 0) {
       e.preventDefault();
       const container = containerRef.current;
@@ -1815,7 +1838,7 @@ function CanvasView({
       const rect = container.getBoundingClientRect();
       const docX = (e.clientX - rect.left - panX) / zoom;
       const docY = (e.clientY - rect.top - panY) / zoom;
-      onMeasureStart?.(docX, docY);
+      onMeasureClick?.(docX, docY);
       return;
     }
     // v2.10: Bucket tool — click fills canvas/selection/layer.
@@ -1851,8 +1874,9 @@ function CanvasView({
       onPan(dragRef.current.panX + dx, dragRef.current.panY + dy);
       return;
     }
-    // v2.14: Measure tool — update end point during drag
-    if (activeTool === 'measure' && onMeasureMove) {
+    // v2.15: Measure tool — live preview of P2 while in 'placing' mode.
+    // Only fires between P1 click and P2 click; once 'complete', moves don't touch the line.
+    if (activeTool === 'measure' && measureMode === 'placing' && onMeasureMove) {
       const container = containerRef.current;
       if (!container) return;
       const rect = container.getBoundingClientRect();
@@ -1883,10 +1907,7 @@ function CanvasView({
   };
 
   const handleMouseUp = (e: React.MouseEvent) => {
-    if (activeTool === 'measure' && onMeasureEnd) {
-      onMeasureEnd();
-      return;
-    }
+    // v2.15: Measure tool no longer uses drag — nothing to do on mouseup.
     if (dragRef.current) {
       dragRef.current = null;
       return;
@@ -1957,8 +1978,6 @@ function CanvasView({
         ? 'crosshair'
         : (dragRef.current ? 'grabbing' : 'default');
 
-  const docNeedsWebGL = docSize && docSize.w > 0 && docSize.w <= 16384 && docSize.h <= 16384;
-
   return (
     <div
       ref={containerRef}
@@ -2010,7 +2029,7 @@ function CanvasView({
           }}
         />
         <canvas
-          key={docNeedsWebGL ? 'webgl' : 'canvas2d'}
+          key={canvasKey}
           ref={canvasRef}
           style={{
             position: 'absolute',
@@ -2061,7 +2080,8 @@ function CanvasView({
 
       {/* Zoom badge removed — zoom/dims/DPI now live in the bottom Status Bar */}
 
-      {/* v2.14: Measure tool overlay — line + distance/angle label + Straighten button */}
+      {/* v2.15: Measure tool overlay — line + distance/angle label + Straighten button.
+           Visible in both 'placing' (live preview) and 'complete' (finalized) modes. */}
       {activeTool === 'measure' && measureLine && (
         <MeasureOverlay
           line={measureLine}
@@ -2069,6 +2089,7 @@ function CanvasView({
           panY={panY}
           zoom={zoom}
           dpi={dpi}
+          measureMode={measureMode}
           onStraighten={onStraighten}
           canStraighten={canStraighten}
         />
@@ -2077,10 +2098,12 @@ function CanvasView({
   );
 }
 
-// v2.15: Measure overlay component — line + distance/angle + Straighten button
-function MeasureOverlay({ line, panX, panY, zoom, dpi = 300, onStraighten, canStraighten }: {
+// v2.15: Measure overlay component — line + distance/angle + Straighten button.
+// Renders in both 'placing' (live preview, no button) and 'complete' (finalized, button shown) modes.
+function MeasureOverlay({ line, panX, panY, zoom, dpi = 300, measureMode = 'complete', onStraighten, canStraighten }: {
   line: { start: { x: number; y: number }; end: { x: number; y: number } };
   panX: number; panY: number; zoom: number; dpi?: number;
+  measureMode?: 'idle' | 'placing' | 'complete';
   onStraighten?: () => void;
   canStraighten?: boolean;
 }) {
@@ -2138,10 +2161,14 @@ function MeasureOverlay({ line, panX, panY, zoom, dpi = 300, onStraighten, canSt
       }}>
         {label}
       </div>
-      {/* Straighten button — only for raster layers (image type) */}
-      {canStraighten && onStraighten && distPx > 5 && (
+      {/* Straighten button — only when measurement is COMPLETE (P2 placed) and active layer is raster/image.
+           Hidden during 'placing' mode because the preview line is still moving.
+           stopPropagation on mousedown prevents the canvas's handleMouseDown from treating
+           the button click as a 3rd measure click (which would start a new measurement). */}
+      {canStraighten && onStraighten && measureMode === 'complete' && distPx > 1 && (
         <button
           onClick={onStraighten}
+          onMouseDown={(e) => e.stopPropagation()}
           style={{
             position: 'absolute',
             left: midX + 8, top: midY + 4,
@@ -2392,7 +2419,7 @@ const TOOLBOX_GROUPS: ToolGroup[] = [
     tools: [
       { id: 'none', icon: '▷', label: 'Cursor', hint: 'Cursor (no tool) — pan/zoom only' },
       { id: 'zoom', icon: '🔍', label: 'Zoom', hint: 'Zoom tool — click=zoom in, Alt+click=zoom out, drag=marquee' },
-      { id: 'measure', icon: '📐', label: 'Measure', hint: 'Measure (U) — drag to measure distance and angle' },
+      { id: 'measure', icon: '📐', label: 'Measure', hint: 'Measure (U) — click P1, click P2, click again to start over' },
     ],
   },
   {
@@ -2527,7 +2554,7 @@ const TOOL_HINTS: Record<ToolId, string> = {
   polygonal: 'Click to add points · double-click to close · P',
   zoom: 'Click to zoom in · Alt+click to zoom out · drag to marquee-zoom',
   bucket: 'Click to fill canvas or selection · B — choose mode in panel below',
-  measure: 'Drag to measure distance and angle · U — also shows angle for layer alignment',
+  measure: 'Click to set P1 · move to preview · click P2 to finalize · click again to start over · U',
 };
 
 function StatusBar({
@@ -3281,6 +3308,9 @@ interface ToolbarProps {
   onOpenOra: () => void;
   onSaveOra: () => void;
   onExportPng: () => void;
+  /** v2.16: Export handlers for new formats. */
+  onExportJpg: () => void;
+  onExportTiff: () => void;
   onImportPng: () => void;
   onUndo: () => void;
   onRedo: () => void;
@@ -3315,6 +3345,8 @@ interface MenuItem {
   onClick?: () => void;
   disabled?: boolean;
   separator?: boolean; // if true, render a divider instead
+  /** v2.16: Nested submenu items. If present, renders as a submenu (▶) instead of a clickable item. */
+  submenu?: MenuItem[];
 }
 
 interface MenuBarDropdownProps {
@@ -3379,27 +3411,80 @@ function MenuBarDropdown({ label, items }: MenuBarDropdownProps) {
             zIndex: 100,
           }}
         >
-          {items.map((item, i) => item.separator ? (
-            <div key={`s${i}`} className="gt-menu-separator" />
-          ) : (
-            <button
-              key={i}
-              type="button"
-              disabled={item.disabled}
-              onClick={() => {
-                setOpen(false);
-                item.onClick?.();
-              }}
-              className="gt-menu-item"
-              style={item.disabled ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
-            >
-              <span className="gt-menu-label">{item.label}</span>
-              {item.shortcut && <span className="gt-menu-shortcut">{item.shortcut}</span>}
-            </button>
-          ))}
+          {items.map((item, i) => renderMenuItem(item, i, () => setOpen(false)))}
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * v2.16: Render a single menu item, including support for nested submenus.
+ * Recursive — a submenu item renders its own dropdown to the right.
+ */
+function renderMenuItem(item: MenuItem, key: number | string, closeParent: () => void): React.ReactNode {
+  if (item.separator) {
+    return <div key={`s${key}`} className="gt-menu-separator" />;
+  }
+
+  // Submenu: render as a non-clickable item with a ▶ arrow, and a nested
+  // dropdown that opens on hover (CSS :hover) or click.
+  if (item.submenu && item.submenu.length > 0) {
+    return (
+      <div
+        key={`sub-${key}`}
+        className="gt-menu-item gt-menu-has-submenu"
+        style={{ position: 'relative' }}
+      >
+        <div
+          className="gt-menu-item-content"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '4px 10px',
+            cursor: 'default',
+          }}
+        >
+          <span className="gt-menu-label">{item.label}</span>
+          <span style={{ marginLeft: 12, fontSize: 10, opacity: 0.6 }}>▶</span>
+        </div>
+        <div
+          className="gt-menu-dropdown gt-menu-submenu"
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: '100%',
+            minWidth: 180,
+            // v2.16.1: NO inline display — CSS .gt-menu-submenu { display:none }
+            // + .gt-menu-has-submenu:hover .gt-menu-submenu { display:block }
+            // handle visibility. Inline display:'none' (specificity 1000)
+            // was overriding the :hover rule (specificity 0020).
+            zIndex: 101,
+          }}
+        >
+          {item.submenu.map((sub, i) => renderMenuItem(sub, `${key}-${i}`, closeParent))}
+        </div>
+      </div>
+    );
+  }
+
+  // Regular clickable item.
+  return (
+    <button
+      key={key}
+      type="button"
+      disabled={item.disabled}
+      onClick={() => {
+        closeParent();
+        item.onClick?.();
+      }}
+      className="gt-menu-item"
+      style={item.disabled ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
+    >
+      <span className="gt-menu-label">{item.label}</span>
+      {item.shortcut && <span className="gt-menu-shortcut">{item.shortcut}</span>}
+    </button>
   );
 }
 
@@ -3719,7 +3804,7 @@ function NewDocumentDialog({ onCreate, onCancel }: NewDocumentDialogProps) {
 }
 
 function Toolbar({
-  onNewDoc, onOpenOra, onSaveOra, onExportPng, onImportPng,
+  onNewDoc, onOpenOra, onSaveOra, onExportPng, onExportJpg, onExportTiff, onImportPng,
   onUndo, onRedo, canUndo, canRedo,
   paramMode, onToggleParamMode, onBakeTransform, canBake,
   docWidth, docHeight, onDocSizeChange, dpi, onDpiChange,
@@ -3733,13 +3818,23 @@ function Toolbar({
   useEffect(() => { setW(docWidth); setH(docHeight); }, [docWidth, docHeight]);
 
   // Gemini 2.4.3 — File / Edit / View / Image dropdown menus
+  // v2.16: File menu now has an Export ▸ submenu with all formats.
+  // v2.16.2: AVIF removed (WASM bloated build to 11.7MB). Will re-add in v2.17 as Tauri asset.
   const fileItems: MenuItem[] = [
     { label: 'New',           onClick: onNewDoc },
     { label: 'Open .ora…',    onClick: onOpenOra },
     { label: 'Save .ora…',    onClick: onSaveOra },
     { separator: true } as MenuItem,
     { label: 'Import PNG…',   onClick: onImportPng },
-    { label: 'Export PNG…',   onClick: onExportPng },
+    { separator: true } as MenuItem,
+    {
+      label: 'Export',
+      submenu: [
+        { label: 'PNG…',  onClick: onExportPng,  shortcut: 'Ctrl+E' },
+        { label: 'JPG…',  onClick: onExportJpg },
+        { label: 'TIFF…', onClick: onExportTiff },
+      ],
+    },
   ];
   const editItems: MenuItem[] = [
     { label: 'Undo', shortcut: 'Ctrl+Z',     onClick: onUndo, disabled: !canUndo },
@@ -3886,12 +3981,12 @@ function Toolbar({
 
 export default function App() {
   // ── State ──────────────────────────────────────────────
-  const [layers, setLayers] = useState<Layer[]>(() => [
-    createSolidLayer('Background', '#ffffff'),
-    createScreentoneLayer('Screentone 1', DEFAULT_PARAMS),
-  ]);
+  // v2.16.1: Init to empty/null — no ghost document on startup.
+  // The New Document dialog (showNewDocDialog=true on mount) handles
+  // initial document creation. Splash screen shows when activeDocId===null.
+  const [layers, setLayers] = useState<Layer[]>([]);
   const [selectedLayerId, setSelectedLayerId] = useState<string | null>(null);
-  const [docSize, setDocSize] = useState(DEFAULT_DOC_SIZE);
+  const [docSize, setDocSize] = useState({ w: 0, h: 0 });
   const [dpi, setDpi] = useState(300);
   const [zoom, setZoom] = useState(0.25);
   const [panX, setPanX] = useState(0);
@@ -3946,8 +4041,14 @@ export default function App() {
   //   'screentone-selection' — fill active selection with screentone (new layer)
   const [bucketMode, setBucketMode] = useState<BucketMode>('solid-canvas');
   const [bucketColor, setBucketColor] = useState('#000000');
-  // v2.14: Measure tool state — {start, end} in doc-px, null = no measurement
+  // v2.15: Measure tool — two-click ruler with 3-click reset cycle.
+  //   'idle': no measurement started.
+  //   'placing': P1 placed, previewing line as cursor moves.
+  //   'complete': P2 placed, line finalized, Straighten button available.
+  // Click cycle: idle→placing (click 1), placing→complete (click 2),
+  //              complete→placing (click 3 = reset + start new at click point).
   const [measureLine, setMeasureLine] = useState<{ start: { x: number; y: number }; end: { x: number; y: number } } | null>(null);
+  const [measureMode, setMeasureMode] = useState<'idle' | 'placing' | 'complete'>('idle');
 
   // ── NEW (v2.3): Right-click popup palette (Krita-style) ──
   // Null = hidden; otherwise {x, y} = clientX/clientY where it appeared.
@@ -3989,42 +4090,42 @@ export default function App() {
   const [activeDocId, setActiveDocId] = useState<string | null>(null);
   const [colorProfile, setColorProfile] = useState<ColorProfile>('gray8');
   // New Document dialog visibility
-  const [showNewDocDialog, setShowNewDocDialog] = useState(false);
+  // v2.16: Show the New Document dialog on startup instead of auto-creating
+  // a default document. The user explicitly chooses document parameters
+  // (size, DPI, color profile, background) before any canvas appears.
+  // This matches Photoshop's startup behavior.
+  const [showNewDocDialog, setShowNewDocDialog] = useState(true);
+
+  // ── v2.18: WebGL renderer state machine (per 6-AI review) ──
+  // 'ready' — WebGL active, normal rendering
+  // 'lost' — webglcontextlost fired, waiting for restore (5s timeout)
+  // 'disabled' — WebGL permanently failed, using Canvas2D fallback
+  const [rendererState, setRendererState] = useState<'ready' | 'lost' | 'disabled'>('ready');
+  // canvasKey forces <canvas> DOM node recreation (only on fatal WebGL loss).
+  // Incrementing triggers React to destroy old canvas + create fresh one,
+  // which allows getContext('2d') to succeed (HTML5: one context type per canvas).
+  const [canvasKey, setCanvasKey] = useState(0);
+
+  // ── v2.16.1: Sync-refs for stale-closure protection ──────
+  // These refs mirror live state so saveActiveDocState and
+  // switchToDocument always read the latest committed values,
+  // even if React hasn't re-created the callback closure yet.
+  // (GPT-5.5-instant's warning about rapid tab switching data loss)
+  const layersRef = useRef(layers); layersRef.current = layers;
+  const docSizeRef = useRef(docSize); docSizeRef.current = docSize;
+  const dpiRef = useRef(dpi); dpiRef.current = dpi;
+  const colorProfileRef = useRef(colorProfile); colorProfileRef.current = colorProfile;
+  const activeSelectionRef = useRef(activeSelection); activeSelectionRef.current = activeSelection;
+  const panXRef = useRef(panX); panXRef.current = panX;
+  const panYRef = useRef(panY); panYRef.current = panY;
+  const zoomRef = useRef(zoom); zoomRef.current = zoom;
+  const selectedLayerIdRef = useRef(selectedLayerId); selectedLayerIdRef.current = selectedLayerId;
 
   // Untitled document counter (for "Untitled-1", "Untitled-2", etc.)
   const untitledCounterRef = useRef(0);
 
-  /**
-   * Create a new DocumentState from options (called by the New Document dialog).
-   * Returns the new doc's ID. Does NOT switch to it — caller handles that.
-   */
-  const createDocument = useCallback((opts: NewDocumentOptions): string => {
-    const id = `doc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const layers: Layer[] = [];
-    if (opts.background === 'white') {
-      layers.push(createSolidLayer('Background', '#ffffff'));
-    }
-    layers.push(createScreentoneLayer('Screentone 1', DEFAULT_PARAMS));
-    const selectedId = layers[layers.length - 1].id;
-
-    const newDoc: DocumentState = {
-      id,
-      name: opts.name || `Untitled-${++untitledCounterRef.current}`,
-      layers,
-      docSize: { w: opts.width, h: opts.height },
-      dpi: opts.dpi,
-      colorProfile: opts.colorProfile,
-      activeSelection: null,
-      viewport: { panX: 0, panY: 0, zoom: 0.25 },
-      selectedLayerId: selectedId,
-      historySnapshot: null,  // history is per-doc, initialized on switch
-      dirty: false,
-      createdAt: Date.now(),
-    };
-
-    setDocuments(prev => [...prev, newDoc]);
-    return id;
-  }, []);
+  // v2.16.1: createDocument removed — logic inlined into handleCreateNewDocument
+  // for atomic state updates (save old + append new in one setDocuments call).
 
   /**
    * Save current live state into the active document's snapshot.
@@ -4038,23 +4139,25 @@ export default function App() {
    */
   const saveActiveDocState = useCallback(() => {
     if (!activeDocId) return;
+    // v2.16.1: Read from sync-refs (not closure) to prevent stale-state data loss
+    // when rapidly switching tabs (GPT-5.5-instant's warning).
     setDocuments(prev => prev.map(d =>
       d.id === activeDocId
         ? {
             ...d,
-            layers,
-            docSize,
-            dpi,
-            colorProfile,
-            activeSelection,
-            viewport: { panX, panY, zoom },
-            selectedLayerId,
+            layers: layersRef.current,
+            docSize: docSizeRef.current,
+            dpi: dpiRef.current,
+            colorProfile: colorProfileRef.current,
+            activeSelection: activeSelectionRef.current,
+            viewport: { panX: panXRef.current, panY: panYRef.current, zoom: zoomRef.current },
+            selectedLayerId: selectedLayerIdRef.current,
             historySnapshot: null,  // not serialized (see note above)
             dirty: true,
           }
         : d
     ));
-  }, [activeDocId, layers, docSize, dpi, colorProfile, activeSelection, panX, panY, zoom, selectedLayerId]);
+  }, [activeDocId]);
 
   /**
    * Load a document's snapshot into live state. Called when switching tabs.
@@ -4111,176 +4214,197 @@ export default function App() {
     }
   }, [activeDocId, layers, docSize, dpi, colorProfile, activeSelection, panX, panY, zoom, selectedLayerId, documents, loadDocState]);
 
-  /**
-   * Close a document tab. If dirty, confirm with user.
-   * Switches to neighbor tab (or null if last doc closed).
-   */
-  const closeDocument = useCallback((docId: string) => {
-    const doc = documents.find(d => d.id === docId);
-    if (!doc) return;
-    if (doc.dirty && !confirm(`Close "${doc.name}"? Unsaved changes will be lost.`)) return;
-
-    setDocuments(prev => {
-      const idx = prev.findIndex(d => d.id === docId);
-      if (idx < 0) return prev;
-      const newDocs = prev.filter(d => d.id !== docId);
-      // If closing active doc, switch to neighbor
-      if (docId === activeDocId) {
-        if (newDocs.length === 0) {
-          // Last doc closed — create a fresh default doc
-          const freshId = `doc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-          const freshDoc: DocumentState = {
-            id: freshId,
-            name: `Untitled-${++untitledCounterRef.current}`,
-            layers: [createSolidLayer('Background', '#ffffff'), createScreentoneLayer('Screentone 1', DEFAULT_PARAMS)],
-            docSize: DEFAULT_DOC_SIZE,
-            dpi: 300,
-            colorProfile: 'gray8',
-            activeSelection: null,
-            viewport: { panX: 0, panY: 0, zoom: 0.25 },
-            selectedLayerId: null,
-            historySnapshot: null,
-            dirty: false,
-            createdAt: Date.now(),
-          };
-          setActiveDocId(freshId);
-          loadDocState(freshDoc);
-          // BUG-C FIX: loadDocState applied pan=(0,0) from the snapshot,
-          // which pins the fresh doc to the top-left. Compute proper
-          // fit-to-view immediately, with a small retry in case the
-          // container hasn't been laid out yet.
-          const fit = computeFitView(DEFAULT_DOC_SIZE.w, DEFAULT_DOC_SIZE.h);
-          if (fit) {
-            setZoom(fit.zoom);
-            setPanX(fit.panX);
-            setPanY(fit.panY);
-          } else {
-            setTimeout(() => {
-              const retry = computeFitView(DEFAULT_DOC_SIZE.w, DEFAULT_DOC_SIZE.h);
-              if (retry) {
-                setZoom(retry.zoom);
-                setPanX(retry.panX);
-                setPanY(retry.panY);
-              }
-            }, 100);
-          }
-          return [freshDoc];
-        }
-        // Switch to neighbor (prefer right, else left)
-        const neighbor = newDocs[Math.min(idx, newDocs.length - 1)];
-        setActiveDocId(neighbor.id);
-        loadDocState(neighbor);
-      }
-      return newDocs;
-    });
-  }, [documents, activeDocId, loadDocState]);
+  // ── v2.16.1: View helpers (moved before closeDocument/handleCreateNewDocument) ──
+  // These were previously declared later in the file, but handleCreateNewDocument
+  // and handleOpenOra depend on handleFitView, so they must be declared first.
 
   /**
-   * Create a new document and switch to it (called by File → New after dialog).
+   * Pure helper: compute zoom + pan to fit a document of (docW × docH)
+   * inside the canvas viewport with `padding` px around it. Does NOT
+   * touch React state — callers do that via setZoom/setPanX.
+   *
+   * Returns null if the container isn't laid out yet (zero size).
    */
-  const handleCreateNewDocument = useCallback((opts: NewDocumentOptions) => {
-    const newId = createDocument(opts);
-    // Save current state to old active doc, then switch
-    if (activeDocId) {
-      setDocuments(prev => prev.map(d =>
-        d.id === activeDocId
-          ? {
-              ...d,
-              layers,
-              docSize,
-              dpi,
-              colorProfile,
-              activeSelection,
-              viewport: { panX, panY, zoom },
-              selectedLayerId,
-              historySnapshot: null,
-              dirty: true,
-            }
-          : d
-      ));
-    }
-    // Switch to new doc — use setTimeout to let setDocuments update first
-    setTimeout(() => {
-      setActiveDocId(newId);
-      // Load the new doc's initial state (from opts, since documents array
-      // may not have updated yet in this closure)
-      const newLayers: Layer[] = [];
-      if (opts.background === 'white') {
-        newLayers.push(createSolidLayer('Background', '#ffffff'));
-      }
-      newLayers.push(createScreentoneLayer('Screentone 1', DEFAULT_PARAMS));
-      setLayers(newLayers);
-      setSelectedLayerId(newLayers[newLayers.length - 1].id);
-      setDocSize({ w: opts.width, h: opts.height });
-      setDpi(opts.dpi);
-      setColorProfile(opts.colorProfile);
-      setActiveSelection(null);
+  const computeFitView = (
+    docW: number, docH: number,
+    padding = 32,
+  ): { zoom: number; panX: number; panY: number } | null => {
+    const container = containerRef.current;
+    if (!container) return null;
+    const rect = container.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+    const z = Math.max(
+      MIN_ZOOM,
+      Math.min(MAX_ZOOM, Math.min((rect.width - padding * 2) / docW, (rect.height - padding * 2) / docH))
+    );
+    return {
+      zoom: z,
+      panX: (rect.width - docW * z) / 2,
+      panY: (rect.height - docH * z) / 2,
+    };
+  };
 
-      // BUG-C FIX: previously used setPanX(0);setPanY(0);setZoom(0.25) —
-      // this left the new doc pinned to the top-left of the viewport
-      // instead of centred. Compute proper fit-to-view here. If the
-      // container isn't laid out yet (e.g. cold start), fall back to a
-      // reasonable default and let the mount useEffect re-fit shortly.
-      const fit = computeFitView(opts.width, opts.height);
-      if (fit) {
-        setZoom(fit.zoom);
-        setPanX(fit.panX);
-        setPanY(fit.panY);
-      } else {
-        // Container not measured yet — defer to a follow-up tick.
-        setZoom(0.25);
-        setTimeout(() => {
-          const retry = computeFitView(opts.width, opts.height);
+  // v2.16.1: handleFitView — double rAF fallback for cold-start container layout.
+  // Previous version returned early if computeFitView returned null (container
+  // not yet measured). Now we defer 2 frames so the browser performs layout
+  // and getBoundingClientRect returns real dimensions.
+  const handleFitView = useCallback((w?: number, h?: number) => {
+    const docW = w ?? docSize.w;
+    const docH = h ?? docSize.h;
+    const fit = computeFitView(docW, docH);
+    if (fit) {
+      setZoom(fit.zoom);
+      setPanX(fit.panX);
+      setPanY(fit.panY);
+    } else {
+      // Container not measured yet (cold start) — defer 2 frames.
+      // Double rAF guarantees browser has performed layout pass.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          const retry = computeFitView(docW, docH);
           if (retry) {
             setZoom(retry.zoom);
             setPanX(retry.panX);
             setPanY(retry.panY);
           }
-        }, 100);
-      }
+        });
+      });
+    }
+  }, [docSize]);
 
-      // Initialize history for the new doc
-      if (historyRef.current) {
-        historyRef.current.initialize(
-          makeSnapshot(newLayers, { width: opts.width, height: opts.height }, newLayers[newLayers.length - 1].id, 'New Document')
-        );
-      }
-    }, 0);
-    setShowNewDocDialog(false);
-  }, [activeDocId, layers, docSize, dpi, colorProfile, activeSelection, panX, panY, zoom, selectedLayerId, createDocument]);
+  /**
+   * Close a document tab. If dirty, confirm with user.
+   * Switches to neighbor tab (or null if last doc closed).
+   */
+  // v2.16.1: closeDocument — synchronous newDocs calculation (Claude variant).
+  // Previous version used setDocuments(prev => { ... setActiveDocId(...) })
+  // which caused stale-closure bugs (setActiveDocId inside updater runs
+  // before React commits, reading stale state). Now we calculate newDocs
+  // synchronously from the closure's `documents` array and call setDocuments
+  // with the plain value, then handle tab switching outside.
+  const closeDocument = useCallback((docId: string) => {
+    const doc = documents.find(d => d.id === docId);
+    if (!doc) return;
+    if (doc.dirty && !confirm(`Close "${doc.name}"? Unsaved changes will be lost.`)) return;
 
-  // Initialize first document on mount (if no documents exist)
-  useEffect(() => {
-    if (documents.length === 0 && !activeDocId) {
-      const id = `doc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const initialLayers = [
-        createSolidLayer('Background', '#ffffff'),
-        createScreentoneLayer('Screentone 1', DEFAULT_PARAMS),
-      ];
-      const initialDoc: DocumentState = {
-        id,
-        name: `Untitled-${++untitledCounterRef.current}`,
-        layers: initialLayers,
-        docSize: DEFAULT_DOC_SIZE,
-        dpi: 300,
-        colorProfile: 'gray8',
-        activeSelection: null,
-        viewport: { panX: 0, panY: 0, zoom: 0.25 },
-        selectedLayerId: initialLayers[1].id,
-        historySnapshot: null,
-        dirty: false,
-        createdAt: Date.now(),
-      };
-      setDocuments([initialDoc]);
-      setActiveDocId(id);
-      // Initialize history
-      if (historyRef.current) {
-        historyRef.current.initialize(
-          makeSnapshot(initialLayers, { width: DEFAULT_DOC_SIZE.w, height: DEFAULT_DOC_SIZE.h }, initialLayers[1].id, 'Initial')
-        );
+    const idx = documents.findIndex(d => d.id === docId);
+    const newDocs = documents.filter(d => d.id !== docId);
+
+    setDocuments(newDocs);
+
+    if (docId === activeDocId) {
+      if (newDocs.length === 0) {
+        // v2.16.1: Last doc closed — show empty splash state (not fresh doc).
+        // User can use File → New to create a new document.
+        setActiveDocId(null);
+        setLayers([]);
+        setSelectedLayerId(null);
+        setDocSize({ w: 0, h: 0 });
+        setDpi(300);
+        setActiveSelection(null);
+        if (historyRef.current) {
+          historyRef.current.clear?.();
+        }
+      } else {
+        // Switch to neighbor (prefer right, else left)
+        const neighbor = newDocs[Math.min(idx, newDocs.length - 1)];
+        setActiveDocId(neighbor.id);
+        loadDocState(neighbor);
       }
     }
-  }, []);  // run once on mount
+  }, [documents, activeDocId, loadDocState]);
+
+  /**
+   * Create a new document and switch to it (called by File → New after dialog).
+   */
+  // v2.16.1: handleCreateNewDocument — atomic, no setTimeout, uses sync-refs.
+  // Previous version used createDocument + setTimeout(0) which caused
+  // intermediate renders with mismatched doc sizes. Now all state updates
+  // are batched by React 18 in a single render.
+  const handleCreateNewDocument = useCallback((opts: NewDocumentOptions) => {
+    // 1. Build new layers ONCE
+    const newLayers: Layer[] = [];
+    if (opts.background === 'white') {
+      newLayers.push(createSolidLayer('Background', '#ffffff'));
+    }
+    newLayers.push(createScreentoneLayer('Screentone 1', DEFAULT_PARAMS));
+    const selectedId = newLayers[newLayers.length - 1].id;
+
+    // 2. Build new doc snapshot
+    const newDoc: DocumentState = {
+      id: `doc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      name: opts.name || `Untitled-${++untitledCounterRef.current}`,
+      layers: newLayers,
+      docSize: { w: opts.width, h: opts.height },
+      dpi: opts.dpi,
+      colorProfile: opts.colorProfile,
+      activeSelection: null,
+      viewport: { panX: 0, panY: 0, zoom: 0.25 },
+      selectedLayerId: selectedId,
+      historySnapshot: null,
+      dirty: false,
+      createdAt: Date.now(),
+    };
+
+    // 3. Atomic: save old active doc (via sync-refs) + append new doc
+    setDocuments(prev => {
+      const updated = activeDocId
+        ? prev.map(d =>
+            d.id === activeDocId
+              ? {
+                  ...d,
+                  layers: layersRef.current,
+                  docSize: docSizeRef.current,
+                  dpi: dpiRef.current,
+                  colorProfile: colorProfileRef.current,
+                  activeSelection: activeSelectionRef.current,
+                  viewport: { panX: panXRef.current, panY: panYRef.current, zoom: zoomRef.current },
+                  selectedLayerId: selectedLayerIdRef.current,
+                  historySnapshot: null,
+                  dirty: true,
+                }
+              : d
+          )
+        : prev;
+      return [...updated, newDoc];
+    });
+
+    // 4. Switch live state (React 18 batches all of these)
+    setActiveDocId(newDoc.id);
+    setLayers(newLayers);
+    setSelectedLayerId(selectedId);
+    setDocSize({ w: opts.width, h: opts.height });
+    setDpi(opts.dpi);
+    setColorProfile(opts.colorProfile);
+    setActiveSelection(null);
+
+    // 5. Fit view (handleFitView has its own rAF fallback)
+    handleFitView(opts.width, opts.height);
+
+    // 6. Initialize history
+    if (historyRef.current) {
+      historyRef.current.initialize(
+        makeSnapshot(newLayers, { width: opts.width, height: opts.height }, selectedId, 'New Document')
+      );
+    }
+
+    setShowNewDocDialog(false);
+  }, [activeDocId, handleFitView]);
+
+  // v2.16: Do NOT auto-create a document on mount. The New Document dialog
+  // is shown on startup (showNewDocDialog initial state = true). The user
+  // explicitly chooses document parameters before any canvas appears.
+  //
+  // The previous behavior auto-created a default 2000×2000 grayscale doc,
+  // which forced the user to resize/reconfigure it. Now the dialog handles
+  // all initial document creation.
+  //
+  // This useEffect is kept (empty) for backward compat — removing it would
+  // require verifying no other code depends on it. It's a no-op now.
+  useEffect(() => {
+    // No-op: document creation is handled by the New Document dialog.
+    // See handleCreateNewDocument (called when the dialog's "Create" is clicked).
+  }, []);
 
   // ── NEW (v2.1): Pre-drag snapshot ref for undo ─────────
   // Captures the layers state BEFORE a transform drag begins so we
@@ -4319,37 +4443,24 @@ export default function App() {
   const imageCache = useImageCache(layers);
   const selectedLayer = layers.find(l => l.id === selectedLayerId) ?? null;
 
-  const compositeCtx: CompositeContext = useMemo(() => ({
-    docWidth: docSize.w,
-    docHeight: docSize.h,
-    imageCache,
-    dpi,
-    perspectiveSubdivisions,
-  }), [docSize, imageCache, dpi, perspectiveSubdivisions]);
-
-  // ── Canvas composite ───────────────────────────────────
+  // ── Canvas composite infrastructure ────────────────────
+  // v2.17: viewportSize declared before compositeCtx (which depends on it).
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef<number | null>(null);
 
-  // NEW (v2.4): Track the canvas viewport size for CanvasScrollbar.
+  // NEW (v2.4): Track the canvas viewport size for CanvasScrollbar + viewport culling.
   // Updated via ResizeObserver on the <main> container.
-  // We use a ref-callback to attach the observer as soon as <main> mounts
-  // (containerRef.current is null on the first useEffect pass when <main>
-  // is conditionally rendered inside the rulers-visible branch).
   const [viewportSize, setViewportSize] = useState({ w: 0, h: 0 });
   const viewportResizeObserverRef = useRef<ResizeObserver | null>(null);
   const setContainerRef = useCallback((el: HTMLDivElement | null) => {
     containerRef.current = el;
-    // Tear down any previous observer
     if (viewportResizeObserverRef.current) {
       viewportResizeObserverRef.current.disconnect();
       viewportResizeObserverRef.current = null;
     }
     if (!el) return;
-    // Measure immediately
     setViewportSize({ w: el.clientWidth, h: el.clientHeight });
-    // Watch for size changes
     const ro = new ResizeObserver(() => {
       setViewportSize({ w: el.clientWidth, h: el.clientHeight });
     });
@@ -4357,20 +4468,54 @@ export default function App() {
     viewportResizeObserverRef.current = ro;
   }, []);
 
+  const compositeCtx: CompositeContext = useMemo(() => {
+    // v2.17: Viewport culling — compute the visible region in doc coordinates.
+    // The canvas is positioned at (panX, panY) and scaled by `zoom`.
+    // Visible doc region = { -panX/zoom, -panY/zoom, viewportW/zoom, viewportH/zoom }
+    // clamped to [0, docSize].
+    let viewport: { x: number; y: number; w: number; h: number } | undefined;
+    if (docSize.w > 0 && docSize.h > 0 && zoom > 0 && viewportSize.w > 0 && viewportSize.h > 0) {
+      const visX = Math.max(0, -panX / zoom);
+      const visY = Math.max(0, -panY / zoom);
+      const visW = Math.min(docSize.w - visX, viewportSize.w / zoom);
+      const visH = Math.min(docSize.h - visY, viewportSize.h / zoom);
+      if (visW > 0 && visH > 0) {
+        viewport = { x: visX, y: visY, w: visW, h: visH };
+      }
+    }
+    return {
+      docWidth: docSize.w,
+      docHeight: docSize.h,
+      imageCache,
+      dpi,
+      perspectiveSubdivisions,
+      viewport,
+    };
+  }, [docSize, imageCache, dpi, perspectiveSubdivisions, viewportSize, panX, panY, zoom]);
+
+  // ── Canvas composite effect ───────────────────────────
+
   useEffect(() => {
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     rafRef.current = requestAnimationFrame(() => {
       const canvas = canvasRef.current;
       if (!canvas) return;
+      // v2.16.1: Guard — skip composite when no document is active.
+      // Prevents canvas resize to 0×0 and WebGL errors on splash screen.
+      if (docSize.w <= 0 || docSize.h <= 0) return;
       if (canvas.width !== docSize.w) canvas.width = docSize.w;
       if (canvas.height !== docSize.h) canvas.height = docSize.h;
       debug.time('composite');
-      // Try WebGL2 first; on any failure (no WebGL2, context lost,
-      // shader compile error, FBO incomplete, etc.) the function
-      // silently falls back to the existing canvas2D compositeLayers
-      // path. During dev: no UI warning. Final GenTonik release will
-      // show a toast on first fallback (TBD).
-      compositeLayersWithFallback(canvas, layers, compositeCtx);
+      // v2.18: Pass onWebGLFallback callback — increments canvasKey to force
+      // <canvas> DOM recreation on fatal WebGL loss. This allows Canvas2D
+      // fallback (HTML5: one context type per canvas).
+      compositeLayersWithFallback(canvas, layers, compositeCtx, () => {
+        if (typeof console !== 'undefined' && console.warn) {
+          console.warn('[GenTonik WebGL] Fatal loss — incrementing canvasKey for Canvas2D fallback');
+        }
+        setRendererState('disabled');
+        setCanvasKey(prev => prev + 1);
+      });
       debug.timeEnd('composite', 'composite');
     });
     return () => {
@@ -4512,6 +4657,14 @@ export default function App() {
 
       // Escape closes popup palette or clears active selection
       if (e.key === 'Escape') {
+        // v2.15: Measure tool — Escape cancels current measurement first.
+        if (activeTool === 'measure' && (measureLine || measureMode !== 'idle')) {
+          e.preventDefault();
+          setMeasureLine(null);
+          setMeasureMode('idle');
+          debug.info('ui', 'Measure cancelled (Escape)');
+          return;
+        }
         if (popupPalette) {
           e.preventDefault();
           setPopupPalette(null);
@@ -4639,7 +4792,7 @@ export default function App() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleUndo, handleRedo, popupPalette, activeSelection, debug, panX, panY, zoom, docSize, pushHistory]);
+  }, [handleUndo, handleRedo, popupPalette, activeSelection, debug, panX, panY, zoom, docSize, pushHistory, activeTool, measureLine, measureMode]);
 
   const handleAddScreentone = useCallback(() => {
     const newLayer = createScreentoneLayer(`Screentone ${layers.filter(l => l.type === 'screentone').length + 1}`, DEFAULT_PARAMS);
@@ -5548,8 +5701,11 @@ export default function App() {
   // visual-only (so the user can see the deformed shape).
   const handleToolChange = useCallback((newTool: ToolId) => {
     setActiveTool(newTool);
-    // v2.14: Clear measure line when switching away from measure tool
-    if (newTool !== 'measure') setMeasureLine(null);
+    // v2.15: Clear measure line AND mode when switching away from measure tool
+    if (newTool !== 'measure') {
+      setMeasureLine(null);
+      setMeasureMode('idle');
+    }
   }, []);
 
   const handleSavePreset = useCallback(() => {
@@ -5697,28 +5853,28 @@ export default function App() {
         if (result.downgradedLayers > 0) {
           debug.info('ora', `${result.downgradedLayers} layer(s) imported as image (no GenToniK metadata).`);
         }
-        // Switch to the new doc
-        setTimeout(() => {
-          setActiveDocId(newId);
-          setLayers(result.layers);
-          setSelectedLayerId(selectedId);
-          setDocSize({ w: result.docWidth, h: result.docHeight });
-          setActiveSelection(null);
-          if (historyRef.current) {
-            historyRef.current.initialize(
-              makeSnapshot(result.layers, { width: result.docWidth, height: result.docHeight }, selectedId, `Open ${file.name}`)
-            );
-          }
-          // Fit view to new doc
-          handleFitView(result.docWidth, result.docHeight);
-        }, 0);
+        // v2.16.1: Switch to the new doc (batched, no setTimeout).
+        // React 18 batches all these state updates into a single render.
+        // handleFitView has its own double-rAF fallback for container layout.
+        setActiveDocId(newId);
+        setLayers(result.layers);
+        setSelectedLayerId(selectedId);
+        setDocSize({ w: result.docWidth, h: result.docHeight });
+        setActiveSelection(null);
+        if (historyRef.current) {
+          historyRef.current.initialize(
+            makeSnapshot(result.layers, { width: result.docWidth, height: result.docHeight }, selectedId, `Open ${file.name}`)
+          );
+        }
+        // Fit view (handleFitView has its own rAF fallback)
+        handleFitView(result.docWidth, result.docHeight);
       } catch (err) {
         debug.error('ora', 'Open failed', err);
         alert(`Failed to open .ora: ${(err as Error).message}`);
       }
     };
     input.click();
-  }, [activeDocId, layers, docSize, dpi, colorProfile, activeSelection, panX, panY, zoom, selectedLayerId]);
+  }, [activeDocId, handleFitView]);
 
   const handleSaveOra = useCallback(async () => {
     try {
@@ -5743,6 +5899,32 @@ export default function App() {
     }
   }, [layers, docSize, imageCache, dpi]);
 
+  // v2.16: Multi-format export via image-export.ts.
+  // All formats use tiled rendering (handles docs > MAX_TEXTURE_SIZE).
+  // v2.16.2: AVIF removed — will re-add in v2.17 as Tauri asset.
+  const handleExportFormat = useCallback(async (format: ImageFormat) => {
+    try {
+      const result = await exportImage(
+        layers,
+        { width: docSize.w, height: docSize.h },
+        imageCache,
+        {
+          format,
+          quality: format === 'jpg' ? 0.92 : undefined,
+          fileName: `gentonik-${Date.now()}`,
+          dpi,
+        },
+      );
+      debug.info('export', `Exported ${result.fileName}: ${(result.bytes / 1024).toFixed(1)} KB`);
+    } catch (err) {
+      debug.error('export', `${format} export failed`, err);
+      alert(`${format.toUpperCase()} export failed: ${(err as Error).message}`);
+    }
+  }, [layers, docSize, imageCache, dpi]);
+
+  const handleExportJpg = useCallback(() => handleExportFormat('jpg'), [handleExportFormat]);
+  const handleExportTiff = useCallback(() => handleExportFormat('tiff'), [handleExportFormat]);
+
   // ── NEW (v2.0): Import PNG via PS bridge ──────────────
   const handleImportPng = useCallback(async () => {
     try {
@@ -5765,50 +5947,9 @@ export default function App() {
   // ── View operations ────────────────────────────────────
   // (containerRef declared above, near canvasRef — needed by screenToCanvas)
 
-  /**
-   * Pure helper: compute zoom + pan to fit a document of (docW × docH)
-   * inside the canvas viewport with `padding` px around it. Does NOT
-   * touch React state — callers do that via setZoom/setPanX.
-   *
-   * Returns null if the container isn't laid out yet (zero size).
-   *
-   * Extracted as a top-level function (not a useCallback) so it can be
-   * called from any handler that needs to fit a fresh doc to view —
-   * handleCreateNewDocument, closeDocument, handleFitView, etc. — without
-   * each of them depending on docSize from their own closure.
-   */
-  const computeFitView = (
-    docW: number, docH: number,
-    padding = 32,
-  ): { zoom: number; panX: number; panY: number } | null => {
-    const container = containerRef.current;
-    if (!container) return null;
-    const rect = container.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return null;
-    const z = Math.max(
-      MIN_ZOOM,
-      Math.min(MAX_ZOOM, Math.min((rect.width - padding * 2) / docW, (rect.height - padding * 2) / docH))
-    );
-    return {
-      zoom: z,
-      panX: (rect.width - docW * z) / 2,
-      panY: (rect.height - docH * z) / 2,
-    };
-  };
-
-  const handleFitView = useCallback((w?: number, h?: number) => {
-    const docW = w ?? docSize.w;
-    const docH = h ?? docSize.h;
-    const fit = computeFitView(docW, docH);
-    if (!fit) return;
-    setZoom(fit.zoom);
-    setPanX(fit.panX);
-    setPanY(fit.panY);
-  }, [docSize]);
-
-  // Fit on mount
+  // Fit on mount — v2.16.1: no setTimeout, handleFitView has rAF fallback
   useEffect(() => {
-    setTimeout(() => handleFitView(), 100);
+    handleFitView();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -5835,6 +5976,8 @@ export default function App() {
         onOpenOra={handleOpenOra}
         onSaveOra={handleSaveOra}
         onExportPng={handleExportPng}
+        onExportJpg={handleExportJpg}
+        onExportTiff={handleExportTiff}
         onImportPng={handleImportPng}
         onUndo={handleUndo}
         onRedo={handleRedo}
@@ -5959,10 +6102,21 @@ export default function App() {
       </div>
 
       {/* 1.7: New Document dialog (Photoshop-style) */}
+      {/* v2.16: On startup, this dialog is shown automatically. Cancel is
+          blocked if no document exists (user must create one to proceed). */}
       {showNewDocDialog && (
         <NewDocumentDialog
           onCreate={handleCreateNewDocument}
-          onCancel={() => setShowNewDocDialog(false)}
+          onCancel={() => {
+            // v2.16: If there are no documents, don't allow cancel — the user
+            // must create at least one document to use the app. Re-show after
+            // a brief alert.
+            if (documents.length === 0) {
+              alert('Please create a new document to start. Click "Create" to continue.');
+              return;
+            }
+            setShowNewDocDialog(false);
+          }}
         />
       )}
 
@@ -6124,7 +6278,17 @@ export default function App() {
                 flex: 1, display: 'flex', position: 'relative',
                 transform: mirrored ? 'scaleX(-1)' : 'none',
               }}>
+              {/* v2.18: PERSISTENT CANVAS — no key={activeDocId}.
+                  Tab switch resizes the canvas (canvas.width = docSize.w) and
+                  clears FBOs to transparent. This avoids WebGL context limit
+                  exhaustion (browsers limit 8-16 contexts per page).
+                  canvasKey is used ONLY for fatal WebGL loss recovery —
+                  incrementing it forces React to recreate the <canvas> DOM node,
+                  which allows Canvas2D fallback (a canvas can only have one
+                  context type per HTML5 spec). */}
+              {activeDocId ? (
               <CanvasView
+                canvasKey={canvasKey}
                 canvasRef={canvasRef}
                 docSize={docSize}
                 zoom={zoom}
@@ -6136,9 +6300,25 @@ export default function App() {
                 compositeCtx={compositeCtx}
                 activeTool={activeTool}
                 onBucketFill={handleBucketFill}
-                onMeasureStart={(docX, docY) => setMeasureLine({ start: { x: docX, y: docY }, end: { x: docX, y: docY } })}
+                onMeasureClick={(docX, docY) => {
+                  // v2.15: Two-click ruler with 3-click reset cycle.
+                  //   idle/complete + click → start new measurement at click point (P1).
+                  //   placing + click → finalize P2 at click point.
+                  //   complete + click → reset AND start new at click point.
+                  if (measureMode === 'idle' || measureMode === 'complete') {
+                    // Start new measurement: P1 = click point, end = P1 (zero-length until move).
+                    setMeasureLine({ start: { x: docX, y: docY }, end: { x: docX, y: docY } });
+                    setMeasureMode('placing');
+                  } else {
+                    // placing → complete: finalize P2 at click point.
+                    setMeasureLine(prev => prev
+                      ? { ...prev, end: { x: docX, y: docY } }
+                      : { start: { x: docX, y: docY }, end: { x: docX, y: docY } });
+                    setMeasureMode('complete');
+                  }
+                }}
                 onMeasureMove={(docX, docY) => setMeasureLine(prev => prev ? { ...prev, end: { x: docX, y: docY } } : null)}
-                onMeasureEnd={() => { /* keep line visible after drag ends */ }}
+                measureMode={measureMode}
                 measureLine={measureLine}
                 dpi={dpi}
                 onStraighten={() => {
@@ -6152,10 +6332,30 @@ export default function App() {
                   );
                   setLayers(newLayers);
                   setMeasureLine(null);
+                  setMeasureMode('idle');
                   debug.info('ui', `Straightened layer "${selectedLayer.name}" by ${angle.toFixed(1)}°`);
                 }}
                 canStraighten={!!selectedLayer && selectedLayer.type === 'image'}
               />
+              ) : (
+                /* v2.16.1: Splash screen when no document is open */
+                <div style={{
+                  flex: 1,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: '#888',
+                  fontSize: 14,
+                  gap: 8,
+                }}>
+                  <div style={{ fontSize: 32, opacity: 0.4 }}>📐</div>
+                  <div>No document open</div>
+                  <div style={{ fontSize: 11, opacity: 0.6 }}>
+                    Use File → New to create a document
+                  </div>
+                </div>
+              )}
               {selectedLayer && (
                 <TransformOverlayCanvas
                   docSize={docSize}

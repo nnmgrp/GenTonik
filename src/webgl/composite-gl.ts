@@ -67,6 +67,7 @@ import { computeHomography, isQuadDegenerate } from '../homography';
 import { applyHomography, invertHomography } from '../homography';
 import type { Layer, Vec2 } from '../types';
 import type { CompositeContext } from '../composite';
+import { getLayerCanvasBounds } from '../composite';
 import { getLayerNaturalSize } from '../types';
 
 // ────────────────────────────────────────────────────────────
@@ -295,6 +296,27 @@ function compositeSingleLayerGL(
   pp: DestPingPong,
 ): boolean {
   const { gl } = state;
+
+  // v2.17: Viewport culling — skip layers completely outside the visible region.
+  // This avoids rendering layer FBOs, mask passes, and composite quads for
+  // layers that won't be visible. For documents with many layers, this is
+  // the biggest perf win.
+  if (compositeCtx.viewport) {
+    const bounds = getLayerCanvasBounds(layer, compositeCtx);
+    if (bounds) {
+      const vp = compositeCtx.viewport;
+      const margin = 2; // slightly larger margin for WebGL (perspective edges)
+      if (bounds.x + bounds.w < vp.x - margin ||
+          bounds.x > vp.x + vp.w + margin ||
+          bounds.y + bounds.h < vp.y - margin ||
+          bounds.y > vp.y + vp.h + margin) {
+        // Layer is completely outside viewport — skip entirely.
+        // Still need to swap ping-pong so the accumulated composite is preserved.
+        swapPingPong(pp);
+        return true;
+      }
+    }
+  }
 
   // ── Compute render size (matches composite.ts logic) ─────
   const naturalSize = getLayerNaturalSize(layer, {
@@ -759,6 +781,13 @@ export function compositeLayersWithFallback(
   canvas: HTMLCanvasElement,
   layers: Layer[],
   compositeCtx: CompositeContext,
+  /**
+   * v2.18: Called when WebGL permanently fails (createGLState returns null
+   * or context is lost and cannot be restored). The caller (App.tsx) should
+   * increment canvasKey to force <canvas> DOM node recreation, which allows
+   * Canvas2D fallback (HTML5: one context type per canvas).
+   */
+  onWebGLFallback?: () => void,
 ): void {
   // PRESERVE-PERSPECTIVE: canvas-space masks (canvasSpacePolygon) are now
   // handled natively in the WebGL composite shader (u_canvasClipTex +
@@ -873,7 +902,18 @@ export function compositeLayersWithFallback(
   }
   if (!state) {
     state = createGLState(canvas);
-    if (state) glStateCache.set(canvas, state);
+    if (state) {
+      glStateCache.set(canvas, state);
+    } else {
+      // v2.18: WebGL initialization failed (context lost on creation, or
+      // WebGL2 unavailable). Signal the caller to recreate the canvas DOM
+      // node — this allows getContext('2d') to succeed on the fresh canvas.
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[GenTonik WebGL] createGLState returned null — signaling Canvas2D fallback');
+      }
+      onWebGLFallback?.();
+      return;
+    }
   }
 
   // If we have a working GL state and it's not lost, try WebGL.
@@ -890,6 +930,10 @@ export function compositeLayersWithFallback(
     if (state.lost) {
       glStateCache.delete(canvas);
       destroyGLState(state);
+      // v2.18: Context lost during composite — signal fallback.
+      // The caller will increment canvasKey to recreate the canvas.
+      onWebGLFallback?.();
+      return;
     }
   }
 

@@ -541,6 +541,28 @@ body {
   background: var(--c-border);
 }
 
+/* v2.16: Submenu support — show nested dropdown on hover */
+.gt-menu-has-submenu {
+  position: relative;
+}
+.gt-menu-has-submenu .gt-menu-submenu {
+  display: none;
+}
+.gt-menu-has-submenu:hover .gt-menu-submenu {
+  display: block;
+}
+.gt-menu-has-submenu .gt-menu-item-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 12px;
+  width: 100%;
+  cursor: default;
+}
+.gt-menu-has-submenu:hover .gt-menu-item-content {
+  background: var(--c-accent-soft);
+}
+
 /* ============================================================
    A2.1a: Selection tool SVG icon overrides
    ============================================================ */

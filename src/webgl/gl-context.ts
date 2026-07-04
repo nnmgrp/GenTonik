@@ -179,6 +179,17 @@ export function createGLState(canvas: HTMLCanvasElement): GLState | null {
     return null;
   }
 
+  // v2.18: Check if context is already lost on creation (happens when
+  // browser has exhausted WebGL context limit — typically 8-16 per page).
+  // Without this check, we'd create a GLState with a dead context, and
+  // every subsequent GL call would silently fail.
+  if (gl.isContextLost()) {
+    if (typeof console !== 'undefined' && console.warn) {
+      console.warn('[GenTonik WebGL] Context lost on creation — WebGL context limit may be exhausted');
+    }
+    return null;
+  }
+
   // ── Step 2: probe capabilities ────────────────────────────
   let maxTextureSize = 4096;
   let maxRenderbufferSize = 4096;

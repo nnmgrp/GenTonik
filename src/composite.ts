@@ -110,6 +110,13 @@ export interface CompositeContext {
   perspectiveSubdivisions?: number;
   /** v2.13: High quality rendering flag (for Bake/Export) using backward mapping. */
   highQuality?: boolean;
+  /**
+   * v2.17: Viewport culling — the visible region in document coordinates.
+   * When set, the composite pipeline only renders pixels inside this rect.
+   * Layers completely outside this rect are skipped entirely.
+   * When undefined, the full document is rendered (backward compat).
+   */
+  viewport?: { x: number; y: number; w: number; h: number };
 }
 
 // ────────────────────────────────────────────────────────────
@@ -919,6 +926,24 @@ function compositeSingleLayer(
 
   if (!layer.visible || layer.opacity <= 0) return;
 
+  // v2.17: Viewport culling — skip layers completely outside the visible region.
+  // This is the biggest perf win for documents with many layers or when zoomed in.
+  if (compositeCtx.viewport) {
+    const bounds = getLayerCanvasBounds(layer, compositeCtx);
+    if (bounds) {
+      const vp = compositeCtx.viewport;
+      // Expand viewport slightly to avoid edge artifacts (1px margin)
+      const margin = 1;
+      if (bounds.x + bounds.w < vp.x - margin ||
+          bounds.x > vp.x + vp.w + margin ||
+          bounds.y + bounds.h < vp.y - margin ||
+          bounds.y > vp.y + vp.h + margin) {
+        // Layer is completely outside viewport — skip entirely
+        return;
+      }
+    }
+  }
+
   const naturalSize = getLayerNaturalSize(layer, {
     docWidth: compositeCtx.docWidth,
     docHeight: compositeCtx.docHeight,
@@ -1084,6 +1109,18 @@ export function compositeLayers(
   // Save/restore around the whole loop so we don't leak any
   // composite-operation or alpha state to the caller.
   destCtx.save();
+
+  // v2.17: Viewport culling — clip to the visible region so Canvas2D
+  // doesn't waste time drawing pixels that will be outside the viewport.
+  // The layer-level culling in compositeSingleLayer skips entirely
+  // off-screen layers; this clip handles partially-visible layers.
+  if (compositeCtx.viewport) {
+    const vp = compositeCtx.viewport;
+    destCtx.beginPath();
+    destCtx.rect(vp.x, vp.y, vp.w, vp.h);
+    destCtx.clip();
+  }
+
   for (const layer of layers) {
     compositeSingleLayer(destCtx, layer, compositeCtx);
   }
