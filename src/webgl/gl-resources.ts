@@ -67,7 +67,30 @@ export function getProgram(state: GLState, key: ProgramKey): WebGLProgram | null
 // Layer offscreen FBO pool (size-keyed)
 // ────────────────────────────────────────────────────────────
 
-const MAX_POOLED_FBOS = 8;
+/**
+ * v2.19 — Phase 1: dynamic pool size based on FBO memory footprint.
+ *
+ * Бюджет VRAM под layer-FBO кэш = 256 МБ (хватает для большинства GPU).
+ * Размер пула = max(2, floor(BUDGET / fboBytes)).
+ *
+ *   - FBO 256×256 (4 МБ при RGBA8):  pool = 64 → cap at 8
+ *   - FBO 1024×1024 (4 МБ):          pool = 8
+ *   - FBO 4096×4096 (67 МБ):         pool = 3
+ *   - FBO 8192×8192 (268 МБ):        pool = 2 (minimum)
+ *
+ * Это гарантирует, что кэш никогда не съест больше 256 МБ VRAM,
+ * даже если все 8 слоёв одинакового размера.
+ */
+const POOL_VRAM_BUDGET_BYTES = 256 * 1024 * 1024;
+const POOL_MIN_ENTRIES = 2;
+const POOL_MAX_ENTRIES = 8;
+
+function computeMaxPooledFBOs(w: number, h: number): number {
+  const bytesPerFBO = w * h * 4; // RGBA8
+  if (bytesPerFBO <= 0) return POOL_MIN_ENTRIES;
+  const byBudget = Math.floor(POOL_VRAM_BUDGET_BYTES / bytesPerFBO);
+  return Math.max(POOL_MIN_ENTRIES, Math.min(POOL_MAX_ENTRIES, byBudget));
+}
 
 /**
  * Acquire a layer FBO of the given size from the pool (or create one).
@@ -132,8 +155,11 @@ export function acquireLayerFBO(
 
   const entry = { fbo, tex, w, h, lastUsed: performance.now() };
 
-  // Enforce pool cap — evict the LRU entry if needed.
-  if (state.layerFBOCache.size >= MAX_POOLED_FBOS) {
+  // Enforce pool cap — evict the LRU entries if needed.
+  // Gemini optimization: use a while loop to immediately evict multiple entries
+  // if size limits shrink dynamically (e.g. going from small to large FBO).
+  const maxPooled = computeMaxPooledFBOs(w, h);
+  while (state.layerFBOCache.size >= maxPooled) {
     let lruKey: string | null = null;
     let lruTime = Infinity;
     for (const [k, v] of state.layerFBOCache) {
@@ -147,6 +173,8 @@ export function acquireLayerFBO(
       gl.deleteFramebuffer(evicted.fbo);
       gl.deleteTexture(evicted.tex);
       state.layerFBOCache.delete(lruKey);
+    } else {
+      break;
     }
   }
 

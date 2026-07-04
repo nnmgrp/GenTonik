@@ -37,6 +37,22 @@
 import * as twgl from 'twgl.js';
 
 /**
+ * v2.19 — Phase 1 (oversized-doc freezes):
+ * Мягкий лимит физического размера dest FBO. Если документ превышает
+ * этот размер по любой стороне, renderScale уменьшается так, чтобы
+ * max(renderW, renderH) ≤ PREVIEW_MAX_DIMENSION.
+ *
+ * Значение 4096 даёт:
+ *   - 12k×17k doc → renderScale 0.241 → 47 МБ на FBO (вместо 757 МБ)
+ *   - 8k×8k doc   → renderScale 0.512 → 33 МБ на FBO
+ *   - 4k×4k doc   → renderScale 1.000 → 67 МБ на FBO (без изменений)
+ *
+ * Экспорт на диск не страдает — compositeLayers (Canvas2D) собирает
+ * финальный файл в полном разрешении, минуя этот cap.
+ */
+const PREVIEW_MAX_DIMENSION = 4096;
+
+/**
  * Per-canvas GL state. Cached on first composite call and reused
  * across frames so we don't pay program-link / FBO-creation cost
  * every render.
@@ -216,13 +232,25 @@ export function createGLState(canvas: HTMLCanvasElement): GLState | null {
   let renderScale = 1.0;
   let renderW = logicalW;
   let renderH = logicalH;
+  // v2.19: hard cap (maxTextureSize) — обязательный.
   if (logicalW > maxTextureSize || logicalH > maxTextureSize) {
     renderScale = Math.min(maxTextureSize / logicalW, maxTextureSize / logicalH);
     renderW = Math.max(1, Math.floor(logicalW * renderScale));
     renderH = Math.max(1, Math.floor(logicalH * renderScale));
-    if (typeof console !== 'undefined' && console.info) {
-      console.info(`[GenTonik WebGL] doc ${logicalW}×${logicalH} exceeds maxTextureSize ${maxTextureSize} — downscaling to ${renderW}×${renderH} (scale=${renderScale.toFixed(4)})`);
+  }
+  // v2.19: soft cap (PREVIEW_MAX_DIMENSION) — для уменьшения VRAM-следа
+  // на больших, но всё ещё влезающих в maxTextureSize документах.
+  const previewMaxDim = Math.max(logicalW, logicalH);
+  if (previewMaxDim > PREVIEW_MAX_DIMENSION) {
+    const softScale = PREVIEW_MAX_DIMENSION / previewMaxDim;
+    if (softScale < renderScale) {
+      renderScale = softScale;
+      renderW = Math.max(1, Math.floor(logicalW * renderScale));
+      renderH = Math.max(1, Math.floor(logicalH * renderScale));
     }
+  }
+  if (renderScale < 1.0 && typeof console !== 'undefined' && console.info) {
+    console.info(`[GenTonik WebGL] doc ${logicalW}×${logicalH} preview → ${renderW}×${renderH} (scale=${renderScale.toFixed(4)})`);
   }
 
   const destTexture = gl.createTexture();
@@ -387,10 +415,21 @@ export function ensureGLStateSize(state: GLState, w: number, h: number): boolean
   let renderScale = 1.0;
   let renderW = w;
   let renderH = h;
+  // v2.19: hard cap (maxTextureSize) — обязательный.
   if (w > maxTex || h > maxTex) {
     renderScale = Math.min(maxTex / w, maxTex / h);
     renderW = Math.max(1, Math.floor(w * renderScale));
     renderH = Math.max(1, Math.floor(h * renderScale));
+  }
+  // v2.19: soft cap (PREVIEW_MAX_DIMENSION) — для уменьшения VRAM-следа
+  const previewMaxDim = Math.max(w, h);
+  if (previewMaxDim > PREVIEW_MAX_DIMENSION) {
+    const softScale = PREVIEW_MAX_DIMENSION / previewMaxDim;
+    if (softScale < renderScale) {
+      renderScale = softScale;
+      renderW = Math.max(1, Math.floor(w * renderScale));
+      renderH = Math.max(1, Math.floor(h * renderScale));
+    }
   }
 
   // Fast path: logical size unchanged AND render size unchanged.
