@@ -109,7 +109,8 @@ import {
   invertHomography,
   applyHomography,
   isQuadDegenerate,
-  normalizeCorners,
+  clampCornerToQuadSafe,
+  QUAD_CLAMP_MIN_PX,
   pointInQuad,
 } from './homography';
 
@@ -1689,16 +1690,15 @@ function computeDragResult(
       const next = [...baseCorners] as [Vec2, Vec2, Vec2, Vec2];
       next[idx] = { x: current.x, y: current.y };
 
-      // BUG-4 FIX: normalize self-intersecting quad (butterfly/hourglass).
-      // If the user drags a corner past the opposite corner, the quad becomes
-      // self-intersecting. Instead of rejecting the drag (old behavior via
-      // isQuadDegenerate), we normalize by swapping the crossed corners.
-      // This lets the user "flip" the layer through itself smoothly.
-      const normalized = normalizeCorners(next);
+      // BUGFIX (Free Transform spaghetti): instead of normalizeCorners (which was
+      // mathematically broken and caused permanent corner swapping / spaghetti points),
+      // we keep corner indices immutable during drag and apply a Krita-style
+      // geometric clamp to keep the quad convex.
+      const clamped = clampCornerToQuadSafe(next, idx as 0 | 1 | 2 | 3, QUAD_CLAMP_MIN_PX);
 
-      if (isQuadDegenerate(normalized)) return null;
+      if (isQuadDegenerate(clamped)) return null;
 
-      return { ...t0, corners: normalized };
+      return { ...t0, corners: clamped };
     }
     case 'perspective-move': {
       const t0 = drag.startTransform;

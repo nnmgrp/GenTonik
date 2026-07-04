@@ -338,14 +338,25 @@ function compositeSingleLayerGL(
   if (renderW <= 0 || renderH <= 0) return true; // nothing to draw
 
   // ── Acquire layer FBO and render content ──────────────────
-  const layerFBO = acquireLayerFBO(state, renderW, renderH);
+  // BUGFIX (oversized docs): scale layer FBO by renderScale so it fits in maxTextureSize.
+  // For doc-sized layers (solid/transparent/text/vector), renderScale already downscales
+  // the destFBO/ping-pong — we apply the same factor here so layer FBOs stay inside GPU limits.
+  // For image/screentone layers with intrinsic naturalSize, also clamp per-layer so a
+  // huge image in a small doc doesn't bypass the doc-level downscale.
+  const layerScale = Math.min(
+    state.renderScale,
+    state.caps.maxTextureSize / Math.max(renderW, renderH),
+  );
+  const layerRenderW = Math.max(1, Math.floor(renderW * layerScale));
+  const layerRenderH = Math.max(1, Math.floor(renderH * layerScale));
+  const layerFBO = acquireLayerFBO(state, layerRenderW, layerRenderH);
   if (!layerFBO) return false;
 
   bindLayerFBO(state, layerFBO);
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT);
 
-  if (!renderLayerContentGL(state, layer, renderW, renderH, compositeCtx.imageCache)) {
+  if (!renderLayerContentGL(state, layer, layerRenderW, layerRenderH, compositeCtx.imageCache)) {
     return false;
   }
 
@@ -840,36 +851,8 @@ export function compositeLayersWithFallback(
   const docMaxDim = Math.max(canvas.width, canvas.height);
   const docTooLarge = docMaxDim > gpuMaxTextureSize * (1 / MAX_DOWNSCALE_FACTOR);
 
-  // Compute max layer dimension. For solid/transparent/text/vector layers
-  // the natural size is 1×1 or undefined, but compositeSingleLayerGL
-  // overrides renderW/H to docSize for these — so we use docSize as their
-  // effective layer size. For image/screentone, naturalSize is the layer's
-  // intrinsic size (which is what acquireLayerFBO receives).
-  let maxLayerDim = 0;
-  for (const layer of layers) {
-    if (!layer.visible || layer.opacity <= 0) continue;
-    let layerW: number, layerH: number;
-    if (layer.type === 'solid' || layer.type === 'transparent'
-        || layer.type === 'text' || layer.type === 'vector') {
-      layerW = compositeCtx.docWidth;
-      layerH = compositeCtx.docHeight;
-    } else {
-      const ns = getLayerNaturalSize(layer, {
-        docWidth: compositeCtx.docWidth,
-        docHeight: compositeCtx.docHeight,
-        imageSizes: compositeCtx.imageCache.sizes,
-      });
-      layerW = ns.w;
-      layerH = ns.h;
-    }
-    maxLayerDim = Math.max(maxLayerDim, layerW, layerH);
-  }
-  const layerTooLarge = maxLayerDim > gpuMaxTextureSize;
-
-  if (docTooLarge || layerTooLarge) {
-    const reason = docTooLarge
-      ? `doc ${canvas.width}×${canvas.height} exceeds ${1 / MAX_DOWNSCALE_FACTOR}× maxTextureSize ${gpuMaxTextureSize}`
-      : `layer max dimension ${maxLayerDim}px exceeds maxTextureSize ${gpuMaxTextureSize} (acquireLayerFBO would return null)`;
+  if (docTooLarge) {
+    const reason = `doc ${canvas.width}×${canvas.height} exceeds ${1 / MAX_DOWNSCALE_FACTOR}× maxTextureSize ${gpuMaxTextureSize}`;
     if (typeof console !== 'undefined' && console.info) {
       console.info(`[GenTonik WebGL] ${reason} — using Canvas2D fallback`);
     }

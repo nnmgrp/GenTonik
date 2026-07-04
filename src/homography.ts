@@ -389,6 +389,58 @@ export function normalizeCorners(quad: readonly [Vec2, Vec2, Vec2, Vec2]): [Vec2
   return [a, b, c, d];
 }
 
+// ─────────────────────────────────────────────────────────────
+// BUG-4 FIX (Krita-style): geometric clamp instead of auto-swapping corners
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Minimum distance (in canvas px) from a corner to its opposite diagonal.
+ * Below this threshold, the corner "slides" along the invisible wall to prevent degeneracy.
+ */
+export const QUAD_CLAMP_MIN_PX = 8;
+
+/**
+ * Clamps a dragged corner of a quad to prevent self-intersection/butterfly shape.
+ * cornerIndex is the vertex being dragged (0=TL, 1=TR, 2=BR, 3=BL).
+ * The dragged corner is constrained to remain at least minDistance pixels away
+ * from the diagonal line connecting its two adjacent neighbors.
+ */
+export function clampCornerToQuadSafe(
+  quad: readonly [Vec2, Vec2, Vec2, Vec2],
+  cornerIndex: 0 | 1 | 2 | 3,
+  minDistance: number = QUAD_CLAMP_MIN_PX,
+): [Vec2, Vec2, Vec2, Vec2] {
+  const result = [quad[0], quad[1], quad[2], quad[3]] as [Vec2, Vec2, Vec2, Vec2];
+  const c = result[cornerIndex];
+
+  // The neighbors for corner Index i are (i+1)%4 and (i+3)%4.
+  // The boundary line is the diagonal connecting these two neighbors.
+  const i1 = (cornerIndex + 1) % 4;
+  const i3 = (cornerIndex + 3) % 4;
+  const A = result[i1];
+  const B = result[i3];
+
+  const ABx = B.x - A.x;
+  const ABy = B.y - A.y;
+  const len = Math.hypot(ABx, ABy);
+  if (len < 1e-6) return result;
+
+  const nx = -ABy / len;
+  const ny = ABx / len;
+
+  // Signed distance of corner c from diagonal line A-B.
+  const signedDist = (c.x - A.x) * nx + (c.y - A.y) * ny;
+
+  if (Math.abs(signedDist) < minDistance) {
+    const safeSignedDist = Math.sign(signedDist || 1) * minDistance;
+    const delta = safeSignedDist - signedDist;
+    result[cornerIndex] = { x: c.x + nx * delta, y: c.y + ny * delta };
+  }
+
+  return result;
+}
+
+
 // ────────────────────────────────────────────────────────────
 // BILINEAR INTERPOLATION (alternative to homography for rendering)
 // ────────────────────────────────────────────────────────────
