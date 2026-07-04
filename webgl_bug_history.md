@@ -1,34 +1,53 @@
-# История борьбы с вылетом WebGL / WebGL Context Loss Bug History
+# История борьбы с вылетом WebGL / WebGL Context Loss Saga History
 
 ## Действующие лица / Cast of Characters
-- **Kimi (AI):** Разработчик изначальной WebGL-интеграции и логики очистки. / Author of the initial WebGL integration and cleanup logic.
-- **Claude 3.5 Sonnet (AI):** Аналитик гонки состояния в React Ref. / Analyzer of the React Ref race condition.
-- **Google Gemini / Antigravity (AI):** Обнаружил циклическую утечку контекстов, лимиты браузера и блокировку Canvas2D. / Discovered the infinite context loop, browser context limits, and Canvas2D lockout.
-- **GLM-5.2 / ChatGLM (AI):** Разработчик финального патча v2.18 с переиспользованием холста и отсечением невидимого вьюпорта. / Author of the final v2.18 patch with canvas reuse and viewport culling.
+- **Kimi (AI):** Изначальный автор WebGL-очистки. / Author of the initial WebGL cleanup logic.
+- **Claude 3.5 Sonnet (AI):** Обнаружил гонку в React Ref. / Identified the React Ref race condition.
+- **Google Gemini (AI):** Выявил лимиты контекстов, бесконечный цикл рекреации и блокировку Canvas2D. / Discovered context limits, the infinite recreation loop, and Canvas2D lockout.
+- **GLM-5.2 (AI):** Внедрил persistent canvas, автомат состояний, onWebGLFallback и Viewport Culling. / Implemented persistent canvas, state machine, fallback callback, and Viewport Culling.
 
 ---
 
-## Хронология событий (Июль 2026) / Chronology of Events (July 2026)
+## 🇷🇺 Русская версия
 
-### 📂 03.07.2026, ~22:00
-- **Проблема:** При создании новых вкладок или переключении документов WebGL «гасился» на всех вкладках сразу. Холсты становились прозрачными.
-- **Анализ Claude:** Обнаружена гонка в React Ref: функция очистки `useEffect` при размонтировании читала `canvasRef.current` слишком поздно, когда React уже перенаправил ссылку на новый холст следующего документа. Очистка гасила WebGL нового холста.
-- **Решение Claude:** Захватывать DOM-узел холста в локальную переменную в теле эффекта во время монтирования.
+### Хронология событий (Июль 2026)
+
+#### 📂 03.07.2026, ~22:00
+- **Проблема:** WebGL падал на всех вкладках при переключении документов.
+- **Анализ Claude:** Обнаружена гонка в React Ref: unmount-очистка читала `canvasRef.current` слишком поздно, когда React уже переключил ссылку на новый холст. Очистка гасила контекст нового холста.
+- **Решение Claude:** Захватывать холст в локальную переменную при монтировании эффекта.
+
+#### 📂 04.07.2026, ~08:50
+- **Проблема:** Падения WebGL продолжались. Выдавалась ошибка `FATAL: WebGL composite failed AND canvas2D fallback unavailable`.
+- **Анализ Gemini:**
+  1. Размонтирование холста на каждый tab-switch (`key={activeDocId}`) исчерпывало лимит WebGL-контекстов браузера (8-16) из-за медленного GC.
+  2. Новые контексты создавались уже потерянными, вызывая бесконечный цикл пересоздания на каждом кадре `requestAnimationFrame`.
+  3. Canvas2D-фоллбек блокировался спецификацией HTML5 (нельзя получить 2D-контекст на холсте, где запрашивался WebGL).
+- **Решение Gemini:** Отказ от `key`. Использование единого постоянного холста с очисткой FBO при переключении. Пересоздание холста (смена `canvasKey`) только при фатальном сбое.
+
+#### 📂 04.07.2026, ~11:00
+- **Разработка GLM-5.2:** Создан патч v2.18 (persistent canvas, автомат состояний, `onWebGLFallback` и оптимизация Viewport Culling — пропуск рендеринга скрытых слоев).
+- **Верификация Gemini:** Сбои WebGL устранены. Система работает стабильно на больших документах. Сверхбольшие документы (например, 12 000 × 17 000 px) не открываются из-за ограничений браузера на выделение памяти под холст ещё до инициализации WebGL. Код успешно залит в Git и отправлен на GitHub.
 
 ---
 
-### 📂 04.07.2026, ~08:50
-- **Проблема:** После фикса гонки ошибки стали реже, но не ушли. Браузер по-прежнему вываливал фатальный лог: `[GenTonik WebGL] FATAL: WebGL composite failed...`.
-- **Анализ Gemini (CDP Automation):** 
-  1. Размонтирование холста на каждый tab-switch (`key={activeDocId}`) приводило к исчерпанию лимита WebGL-контекстов в браузере (8-16 на страницу) из-за асинхронности GC.
-  2. Браузер отдавал новые контексты в состоянии `isContextLost() === true`.
-  3. Это запускало бесконечный цикл создания/деструкции WebGL-контекстов на каждом кадре `requestAnimationFrame`.
-  4. Попытка фоллбека на Canvas2D на том же холсте блокировалась спецификацией HTML5 (нельзя получить 2D-контекст на холсте, где запрашивался WebGL).
-- **Решение Gemini:** Полный отказ от `key={activeDocId}`. Использование единого постоянного холста с очисткой FBO при смене вкладок. Пересоздание холста (сброс по `canvasKey`) только при фатальном сбое.
+## 🇺🇸 English Version
 
----
+### Chronology of Events (July 2026)
 
-### 📂 04.07.2026, ~11:00
-- **Разработка GLM-5.2:** Сгенерирован финальный патч v2.18.
-- **Оптимизация:** Добавлено **отсечение невидимых областей (Viewport Culling)** в `composite-gl.ts` (слои за пределами экрана не рендерятся в GPU, что радикально подняло FPS).
-- **Верификация Gemini:** Код проверен через CDP-автоматизацию, сбои устранены полностью. WebGL стабильно работает при открытии сверхбольших документов (до 12 000 × 17 000 px). Код залит в репозиторий GitHub.
+#### 📂 July 3, 2026, ~22:00
+- **Issue:** WebGL crashed on all tabs when switching documents.
+- **Claude Analysis:** Detected a race condition in the React Ref: the unmount cleanup effect read `canvasRef.current` too late, after React had already updated the ref to the new tab's canvas. The cleanup destroyed the new canvas context.
+- **Claude Solution:** Capture the canvas DOM node in a local variable during mount.
+
+#### 📂 July 4, 2026, ~08:50
+- **Issue:** WebGL crashes persisted. Browser logged `FATAL: WebGL composite failed AND canvas2D fallback unavailable`.
+- **Gemini Analysis:**
+  1. Re-creating the canvas on tab-switch (`key={activeDocId}`) exhausted the browser's WebGL context limit (8-16) due to slow async GC.
+  2. New contexts were created in an already-lost state, triggering an infinite loop of context recreation on every `requestAnimationFrame`.
+  3. Canvas2D fallback was blocked by the HTML5 spec (cannot query 2D context on a canvas where WebGL was already requested).
+- **Gemini Solution:** Persistent canvas (no `key`). Clear FBOs to transparent on tab switch. Recreate the canvas (increment `canvasKey`) only on fatal WebGL loss.
+
+#### 📂 July 4, 2026, ~11:00
+- **GLM-5.2 Implementation:** Created the v2.18 patch (persistent canvas, state machine, `onWebGLFallback`, and Viewport Culling — skipping rendering of off-screen layers).
+- **Gemini Verification:** WebGL crashes resolved. System works stably on large documents. Extra-large documents (e.g. 12,000 × 17,000 px) do not open due to browser-level memory allocation limits for canvas nodes before WebGL even initializes. Code pushed to GitHub.
